@@ -1,111 +1,145 @@
 """
-profiling.py — Memory and latency profiling for llama.cpp + Apple Silicon.
+profiling.py — backend-aware memory and latency profiling.
 
-Two-phase measurement strategy
--------------------------------
-Phase 1 — Model load (ModelProfiler):
-  On Apple Silicon, `n_gpu_layers=-1` offloads ALL model weights to the Metal
-  GPU via unified memory.  `psutil.rss` only reflects CPU-side anonymous pages
-  and is therefore blind to the weights.  The authoritative memory figure is the
-  GGUF file size on disk, which equals the weight tensor memory transferred to
-  unified memory.  We additionally capture the CPU-side RSS delta around the
-  load call to account for KV-cache allocation, llama.cpp bookkeeping, and Python
-  interpreter overhead.
+Memory
+------
+Where the weights live depends on the backend, so a single measurement
+strategy cannot be correct everywhere:
 
-  Reported fields (stored once per model run, constant across prompts):
-    model_weight_mb   — GGUF file size in MiB  (weight memory in unified/GPU RAM)
-    cpu_overhead_mb   — RSS(post-load) – RSS(pre-load)  (CPU-side runtime cost)
-    total_memory_mb   — model_weight_mb + cpu_overhead_mb
+  cuda   vram_mb    = NVML delta around the load call (weights + KV cache +
+                      compute buffers + CUDA context)
+         host_mb    = RSS delta (host-side staging and bookkeeping)
+         total      = vram_mb + host_mb
+  metal  weights_mb = GGUF file size (unified memory; RSS cannot see it)
+         host_mb    = RSS delta
+         total      = weights_mb + host_mb
+  cpu    total      = max(RSS delta, GGUF size)
+                      llama.cpp mmaps the file, so RSS under-reports until
+                      pages are faulted in; the file size is the floor.
 
-Phase 2 — Per-prompt inference (InferenceProfiler):
-  Measures wall-clock latency only.  Per-inference RSS fluctuations are ≤50 MB
-  (KV-cache reuse) and are not reported as a separate memory figure to avoid
-  misleading reviewers.
+`weights_mb` is always reported separately.  It is the one hardware-
+independent memory figure and is the honest x-axis for a Pareto plot.
+
+Partial offload
+---------------
+When VRAM is short, llama.cpp silently places some layers on the host and
+runs a hybrid.  Timings from such a run are not comparable to a fully
+offloaded one, so `offload_ok` flags it and callers abort.
+
+Latency
+-------
+`InferenceProfiler` measures wall clock only.  Aggregation is median-based
+(see `latency_summary`): on a shared cloud host a single scheduling hiccup
+moves a mean but not a median.
 """
 
+import math
 import os
 import time
-import psutil
+from typing import Dict, List, Optional, Sequence
+
+from evaluation.hardware import CPU, CUDA, METAL, MemorySampler
+
+# A full offload should account for at least this share of the weight bytes.
+OFFLOAD_TOLERANCE = 0.90
 
 
 class ModelProfiler:
     """
-    Wraps model load to capture accurate memory usage.
+    Wraps a model load to capture memory usage on whichever backend is active.
 
     Usage
     -----
-    profiler = ModelProfiler(model_path)
+    profiler = ModelProfiler(model_path, backend="cuda")
     profiler.before_load()
-    model = LLMGuard(...)          # the actual load call
+    model = LLMGuard(...)
     profiler.after_load()
-    weight_mb, overhead_mb, total_mb = profiler.memory_stats()
+    stats = profiler.stats()
     """
 
-    def __init__(self, model_path: str):
-        """
-        Parameters
-        ----------
-        model_path : str
-            Absolute or relative path to the GGUF weight file.  Used to read
-            the on-disk size, which equals the unified-memory footprint for a
-            full Metal offload (n_gpu_layers=-1).
-        """
-        self._model_path = model_path
-        self._process = psutil.Process(os.getpid())
+    def __init__(self, model_path: str, backend: str = CPU):
+        self.model_path = model_path
+        self.backend = backend
+        self._sampler = MemorySampler(backend)
 
-        # Populated by before_load() / after_load()
-        self._rss_before_mb: float = 0.0
-        self._rss_after_mb: float = 0.0
+        self._host_before = 0.0
+        self._host_after = 0.0
+        self._device_before = float("nan")
+        self._device_after = float("nan")
 
-        # Public results (set after after_load())
-        self.model_weight_mb: float = 0.0
-        self.cpu_overhead_mb: float = 0.0
-        self.total_memory_mb: float = 0.0
-
-    # ------------------------------------------------------------------
-    # Measurement API
-    # ------------------------------------------------------------------
+        self.weights_mb = 0.0
+        self.host_mb = 0.0
+        self.vram_mb = float("nan")
+        self.total_memory_mb = 0.0
+        self.offload_ok: Optional[bool] = None
+        self.notes: List[str] = []
 
     def before_load(self) -> None:
-        """Call immediately before the model load statement."""
-        self._rss_before_mb = self._process.memory_info().rss / (1024 * 1024)
+        self._host_before = self._sampler.host_rss_mb()
+        self._device_before = self._sampler.device_mb()
 
     def after_load(self) -> None:
-        """Call immediately after the model load statement completes."""
-        self._rss_after_mb = self._process.memory_info().rss / (1024 * 1024)
+        self._host_after = self._sampler.host_rss_mb()
+        self._device_after = self._sampler.device_mb()
 
-        # Weight memory = GGUF file size (authoritative for Metal GPU offload)
-        self.model_weight_mb = os.path.getsize(self._model_path) / (1024 * 1024)
+        self.weights_mb = os.path.getsize(self.model_path) / (1024 * 1024)
+        self.host_mb = max(0.0, self._host_after - self._host_before)
 
-        # CPU-side overhead = RSS delta; clamp to 0 in case of GC noise
-        self.cpu_overhead_mb = max(0.0, self._rss_after_mb - self._rss_before_mb)
+        if self.backend == CUDA:
+            if math.isnan(self._device_after) or math.isnan(self._device_before):
+                self.vram_mb = float("nan")
+                self.total_memory_mb = self.weights_mb + self.host_mb
+                self.offload_ok = None
+                self.notes.append(
+                    "NVML unavailable; VRAM not measured and offload not verified. "
+                    "Install nvidia-ml-py (pip install nvidia-ml-py)."
+                )
+            else:
+                self.vram_mb = max(0.0, self._device_after - self._device_before)
+                self.total_memory_mb = self.vram_mb + self.host_mb
+                self.offload_ok = self.vram_mb >= OFFLOAD_TOLERANCE * self.weights_mb
+                if not self.offload_ok:
+                    self.notes.append(
+                        f"VRAM delta {self.vram_mb:.0f} MB is below "
+                        f"{OFFLOAD_TOLERANCE:.0%} of the {self.weights_mb:.0f} MB weight file: "
+                        f"llama.cpp likely offloaded only some layers and is running a "
+                        f"CPU/GPU hybrid. Timings from this run are not comparable."
+                    )
+        elif self.backend == METAL:
+            self.total_memory_mb = self.weights_mb + self.host_mb
+            self.offload_ok = True
+        else:
+            self.total_memory_mb = max(self.host_mb, self.weights_mb)
+            self.offload_ok = True
 
-        self.total_memory_mb = self.model_weight_mb + self.cpu_overhead_mb
+        self._sampler.close()
 
-    def memory_stats(self) -> tuple:
-        """
-        Returns
-        -------
-        (model_weight_mb, cpu_overhead_mb, total_memory_mb)
-        """
-        return self.model_weight_mb, self.cpu_overhead_mb, self.total_memory_mb
+    def stats(self) -> Dict[str, object]:
+        return {
+            "backend": self.backend,
+            "weights_mb": round(self.weights_mb, 1),
+            "vram_mb": None if math.isnan(self.vram_mb) else round(self.vram_mb, 1),
+            "host_mb": round(self.host_mb, 1),
+            "total_memory_mb": round(self.total_memory_mb, 1),
+            "offload_ok": self.offload_ok,
+        }
 
     def summary(self) -> str:
-        return (
-            f"  Model weights (GGUF / unified mem): {self.model_weight_mb:>8.1f} MB\n"
-            f"  CPU-side RSS overhead (post-load):  {self.cpu_overhead_mb:>8.1f} MB\n"
-            f"  Total reported memory:              {self.total_memory_mb:>8.1f} MB"
-        )
+        vram = "n/a" if math.isnan(self.vram_mb) else f"{self.vram_mb:>8.1f} MB"
+        lines = [
+            f"  backend:                            {self.backend}",
+            f"  Weight file (GGUF on disk):         {self.weights_mb:>8.1f} MB",
+            f"  Device memory (VRAM delta):         {vram}",
+            f"  Host RSS delta:                     {self.host_mb:>8.1f} MB",
+            f"  Total reported memory:              {self.total_memory_mb:>8.1f} MB",
+        ]
+        for note in self.notes:
+            lines.append(f"  ! {note}")
+        return "\n".join(lines)
 
 
 class InferenceProfiler:
-    """
-    Lightweight per-prompt profiler that measures wall-clock latency only.
-
-    Memory is NOT tracked here — it is constant after model load (weights stay
-    in unified memory, KV cache is reused).  Mixing per-inference RSS noise
-    into the reported memory figure would be misleading.
-    """
+    """Wall-clock latency for a single scoring call."""
 
     def __init__(self):
         self._t0: float = 0.0
@@ -115,6 +149,31 @@ class InferenceProfiler:
         self._t0 = time.perf_counter()
 
     def stop(self) -> float:
-        """Returns wall-clock latency in seconds."""
         self.latency_sec = time.perf_counter() - self._t0
         return self.latency_sec
+
+
+def latency_summary(values: Sequence[float]) -> Dict[str, float]:
+    """
+    Median-centred latency statistics.
+
+    The median and IQR are reported instead of the mean because these runs
+    share a host with other tenants; p95 is kept because a guardrail's tail
+    latency is what a deployment actually feels.
+    """
+    import numpy as np
+
+    clean = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=float)
+    if clean.size == 0:
+        return {k: float("nan") for k in
+                ("latency_median_sec", "latency_p25_sec", "latency_p75_sec",
+                 "latency_p95_sec", "latency_mean_sec", "latency_std_sec", "latency_n")}
+    return {
+        "latency_median_sec": float(np.median(clean)),
+        "latency_p25_sec": float(np.percentile(clean, 25)),
+        "latency_p75_sec": float(np.percentile(clean, 75)),
+        "latency_p95_sec": float(np.percentile(clean, 95)),
+        "latency_mean_sec": float(np.mean(clean)),
+        "latency_std_sec": float(np.std(clean, ddof=1)) if clean.size > 1 else 0.0,
+        "latency_n": int(clean.size),
+    }

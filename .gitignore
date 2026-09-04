@@ -1,1 +1,3 @@
 models/weights
+# smoke-test scratch output
+results/smoke/
