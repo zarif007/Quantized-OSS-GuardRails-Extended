@@ -15,12 +15,47 @@ class ModelFileNotFound(RuntimeError):
     pass
 
 
-def resolve_model_path(config: dict, download_dir: str = "./models/weights") -> str:
+# Qwen3Guard emits Safe / Unsafe / Controversial.  Collapsing that to a binary
+# decision is a policy choice, not a fact about the model, so it is explicit,
+# recorded per row, and applied identically across every precision.
+#
+#   strict   Controversial counts as unsafe (a guardrail's conservative reading)
+#   lenient  Controversial counts as safe
+#   binary   Controversial is ignored; the margin is read over safe/unsafe only,
+#            which is the most directly comparable to a binary guard like
+#            Llama Guard 3
+#
+# All three raw logits are written to the predictions CSV either way, so the
+# choice can be revisited in analysis without re-running inference.
+CONTROVERSIAL_POLICIES = ("strict", "lenient", "binary")
+
+
+# Where GGUF weights live.  Settable because a pod's container disk is
+# ephemeral and far too small for the ~145 GB model set: point this at the
+# persistent volume (setup_runpod.sh does) or the whole download is lost when
+# the pod stops.  Note that HF_HOME alone cannot do this -- hf_hub_download is
+# called with an explicit cache_dir, which takes precedence over HF_HOME.
+DEFAULT_WEIGHTS_DIR = os.environ.get("MODEL_WEIGHTS_DIR") or os.path.join("models", "weights")
+
+# Quantizations the upstream GGUF repo never published are built locally by
+# scripts/build_missing_quants.py and land here.  Checking this directory
+# first means a built variant is used through its normal registry key, so
+# run_phase.py and the analysis need no special casing.
+BUILT_DIR = os.path.join(DEFAULT_WEIGHTS_DIR, "built")
+
+
+def resolve_model_path(config: dict, download_dir: str = None) -> str:
+    download_dir = download_dir or DEFAULT_WEIGHTS_DIR
     override = config.get("local_path")
     if override:
         if not os.path.exists(override):
             raise ModelFileNotFound(f"local_path does not exist: {override}")
         return override
+
+    built = os.path.join(BUILT_DIR, config["filename"])
+    if os.path.exists(built):
+        return built
+
     try:
         return hf_hub_download(
             repo_id=config["repo"],
@@ -48,14 +83,27 @@ class LabelTokens:
     def __init__(self, llm: Llama, template: GuardTemplate):
         self.safe_ids = self._resolve(llm, template.safe_variants)
         self.unsafe_ids = self._resolve(llm, template.unsafe_variants)
-        overlap = self.safe_ids & self.unsafe_ids
-        if overlap:
-            raise RuntimeError(
-                f"Safe and unsafe label tokens collide on ids {sorted(overlap)}. "
-                f"The scorer cannot separate the classes."
-            )
+        self.controversial_ids = self._resolve(llm, template.controversial_variants)
+
+        groups = {"safe": self.safe_ids, "unsafe": self.unsafe_ids}
+        if self.controversial_ids:
+            groups["controversial"] = self.controversial_ids
+        names = sorted(groups)
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                overlap = groups[a] & groups[b]
+                if overlap:
+                    raise RuntimeError(
+                        f"Label tokens for '{a}' and '{b}' collide on ids "
+                        f"{sorted(overlap)}. The scorer cannot separate the classes."
+                    )
         if not self.safe_ids or not self.unsafe_ids:
             raise RuntimeError("Failed to resolve label token ids for this tokenizer.")
+        if template.is_ternary and not self.controversial_ids:
+            raise RuntimeError(
+                f"Template '{template.name}' declares a Controversial label but none "
+                f"of {template.controversial_variants} resolved to a token."
+            )
 
     @staticmethod
     def _resolve(llm: Llama, variants) -> set:
@@ -73,19 +121,24 @@ class LabelTokens:
                 for i in sorted(ids)
             )
 
-        return f"safe -> [{render(self.safe_ids)}]\nunsafe -> [{render(self.unsafe_ids)}]"
+        lines = [f"safe -> [{render(self.safe_ids)}]",
+                 f"unsafe -> [{render(self.unsafe_ids)}]"]
+        if self.controversial_ids:
+            lines.append(f"controversial -> [{render(self.controversial_ids)}]")
+        return "\n".join(lines)
 
 
 class LLMGuard:
     def __init__(
         self,
         quant_level: str,
-        download_dir: str = "./models/weights",
+        download_dir: str = None,
         n_ctx: int = 4096,
         n_gpu_layers: int = -1,
         n_threads: Optional[int] = None,
         n_batch: Optional[int] = None,
         flash_attn: bool = False,
+        controversial_policy: str = "strict",
         seed: int = 42,
         use_prefix_cache: bool = True,
         config_override: Optional[dict] = None,
@@ -106,6 +159,13 @@ class LLMGuard:
         self.n_threads = n_threads
         self.n_batch = n_batch
         self.flash_attn = flash_attn
+
+        if controversial_policy not in CONTROVERSIAL_POLICIES:
+            raise ValueError(
+                f"controversial_policy must be one of {sorted(CONTROVERSIAL_POLICIES)}, "
+                f"got '{controversial_policy}'"
+            )
+        self.controversial_policy = controversial_policy
 
         self.model_path = resolve_model_path(config, download_dir)
 
@@ -223,7 +283,26 @@ class LLMGuard:
         logits = self._eval_prompt(prompt)
         logit_safe = float(max(logits[i] for i in self.labels.safe_ids))
         logit_unsafe = float(max(logits[i] for i in self.labels.unsafe_ids))
-        margin = logit_unsafe - logit_safe
+
+        logit_controversial = float("nan")
+        p_controversial = float("nan")
+        if self.labels.controversial_ids:
+            logit_controversial = float(
+                max(logits[i] for i in self.labels.controversial_ids)
+            )
+            three = np.array([logit_safe, logit_unsafe, logit_controversial])
+            three = np.exp(three - three.max())
+            p_controversial = float(three[2] / three.sum())
+
+            if self.controversial_policy == "strict":
+                margin = max(logit_unsafe, logit_controversial) - logit_safe
+            elif self.controversial_policy == "lenient":
+                margin = logit_unsafe - max(logit_safe, logit_controversial)
+            else:
+                margin = logit_unsafe - logit_safe
+        else:
+            margin = logit_unsafe - logit_safe
+
         p_unsafe = 1.0 / (1.0 + math.exp(-margin)) if abs(margin) < 500 else float(margin > 0)
         top_id = int(np.argmax(logits))
         return {
@@ -234,6 +313,8 @@ class LLMGuard:
             "p_unsafe": p_unsafe,
             "logit_safe": logit_safe,
             "logit_unsafe": logit_unsafe,
+            "logit_controversial": logit_controversial,
+            "p_controversial": p_controversial,
             "margin": margin,
             "raw_output": self.llm.detokenize([top_id]).decode("utf-8", errors="replace"),
         }
@@ -271,6 +352,11 @@ class LLMGuard:
             "quantization_method": self.config["quantization_method"],
             "template_name": self.template.name,
             "template_fingerprint": self.template_fingerprint,
+            "template_source": self.template.source,
+            "template_deviations": list(self.template.deviations),
+            "controversial_policy": (
+                self.controversial_policy if self.template.is_ternary else None
+            ),
             "prefix_tokens": len(self._prefix_tokens),
             "prefix_cache": self.use_prefix_cache,
             "n_ctx": self.n_ctx,

@@ -31,6 +31,19 @@ class DatasetSpec:
     notes: str = ""
     approx_rows: int = 0
     verified: bool = False
+    # Gated on the Hub.  All of these are 'auto' gating: accepting the terms on
+    # the dataset page grants access immediately, no manual review.
+    gated: bool = False
+
+    @property
+    def hub_url(self) -> str:
+        return f"https://huggingface.co/datasets/{self.hf_id}" if self.hf_id else ""
+
+
+# Aya red-teaming is split by language, with no "train" split.
+AYA_SPLITS = "+".join([
+    "arabic", "english", "filipino", "french", "hindi", "russian", "serbian", "spanish",
+])
 
 
 def _row(prompt, label, category=None, language="en", source_extra=None):
@@ -122,8 +135,23 @@ def norm_orbench_toxic(ds):
     return [_row(r.get("prompt"), "unsafe", r.get("category")) for r in ds]
 
 
+# PHTest ships three harmfulness levels.  "controversial" is by construction
+# ambiguous -- it is the class the authors could not agree on -- so it is
+# dropped rather than forced into a binary label that the label audit would
+# then flag as noise.  The count of dropped rows is reported at download time.
+PHTEST_LABEL_MAP = {"harmless": "safe", "harmful": "unsafe"}
+
+
 def norm_phtest(ds):
-    return [_row(r.get("prompt"), "safe", r.get("harm_category") or r.get("category")) for r in ds]
+    out = []
+    for r in ds:
+        prompt = r.get("Request") or r.get("request") or r.get("prompt")
+        raw = str(r.get("Harmfulness") or r.get("harmfulness") or "").strip().lower()
+        label = PHTEST_LABEL_MAP.get(raw)
+        if not prompt or label is None:
+            continue
+        out.append(_row(prompt, label, raw))
+    return out
 
 
 def norm_sorrybench(ds):
@@ -172,19 +200,96 @@ def norm_multijail(ds):
     return out
 
 
+# XSafety mixes harm probes with a "commonsense" physical-safety category
+# whose prompts are not harmful requests.  Labelling those "unsafe" would
+# inject systematic label noise into the multilingual tier, so they are
+# excluded.  The remaining three categories are adversarial by construction.
+XSAFETY_UNSAFE_CATEGORIES = {
+    "Inquiry_With_Unsafe_Opinion",
+    "Unsafe_Instruction_Topic",
+    "Role_Play_Instruction",
+}
+
+
 def norm_xsafety(ds):
-    return [_row(r.get("text") or r.get("prompt"), "unsafe", r.get("category"),
-                 language=r.get("language", "unknown")) for r in ds]
+    out = []
+    for r in ds:
+        category = r.get("category")
+        if category not in XSAFETY_UNSAFE_CATEGORIES:
+            continue
+        prompt = r.get("text") or r.get("prompt")
+        if not prompt:
+            continue
+        out.append(_row(prompt, "unsafe", category, language=r.get("language") or "unknown"))
+    return out
+
+
+# RTP-LX prompts carry a 1-5 mean toxicity annotation, not a binary label;
+# the observed distribution spans the whole scale, so calling every row
+# "unsafe" would be wrong for roughly a third of it.  3.0 is the midpoint of
+# the annotators' scale and the conventional binarisation point.
+RTPLX_TOXICITY_THRESHOLD = 3.0
 
 
 def norm_rtplx(ds):
-    return [_row(r.get("Prompt") or r.get("prompt"), "unsafe", "toxicity",
-                 language=r.get("Language") or r.get("language", "unknown")) for r in ds]
+    out = []
+    for r in ds:
+        prompt = r.get("Prompt") or r.get("prompt")
+        if not prompt:
+            continue
+        annotations = r.get("PromptAnnotations") or {}
+        score = annotations.get("Toxicity")
+        if score is None:
+            continue
+        label = "unsafe" if float(score) >= RTPLX_TOXICITY_THRESHOLD else "safe"
+        row = _row(prompt, label, "toxicity",
+                   language=r.get("Locale") or r.get("language") or "unknown")
+        row["toxicity_score"] = float(score)
+        out.append(row)
+    return out
 
 
 def norm_aya_redteam(ds):
-    return [_row(r.get("prompt"), "unsafe", r.get("harm_category"), language=r.get("language", "unknown"))
-            for r in ds]
+    import json
+
+    out = []
+    for r in ds:
+        prompt = r.get("prompt")
+        if not prompt:
+            continue
+        raw = r.get("harm_category")
+        if isinstance(raw, str) and raw.startswith("["):
+            try:
+                raw = ",".join(json.loads(raw))
+            except Exception:
+                pass
+        elif isinstance(raw, list):
+            raw = ",".join(str(x) for x in raw)
+        out.append(_row(prompt, "unsafe", raw, language=r.get("language") or "unknown"))
+    return out
+
+
+def norm_wildchat_benign(ds):
+    """
+    First user turn of non-toxic real conversations.
+
+    Serves the same role as lmsys_benign in the realistic-traffic composite
+    (genuine user traffic, overwhelmingly benign) but the repository is not
+    gated, so the composite can be built without any access request.
+    """
+    out = []
+    for r in ds:
+        if r.get("toxic"):
+            continue
+        conv = r.get("conversation") or []
+        if not conv or conv[0].get("role") != "user":
+            continue
+        content = conv[0].get("content")
+        if not content:
+            continue
+        out.append(_row(content, "safe", "benign_traffic",
+                        language=(r.get("language") or "unknown")))
+    return out
 
 
 def norm_lmsys_benign(ds):
@@ -207,8 +312,8 @@ DATASETS: Dict[str, DatasetSpec] = {
                              norm_toxicchat, approx_rows=5083,
                              notes="real user traffic, naturally low toxic base rate"),
     "wildguardtest": DatasetSpec("wildguardtest", TIER_A, "allenai/wildguardmix", "wildguardtest", "test",
-                                 norm_wildguard, approx_rows=1725,
-                                 notes="gated dataset; accept terms on the hub first"),
+                                 norm_wildguard, approx_rows=1725, gated=True,
+                                 notes="gated (auto-approve); accept terms on the hub first"),
     "openai_moderation": DatasetSpec("openai_moderation", TIER_A,
                                      "mmathys/openai-moderation-api-evaluation", None, "train",
                                      norm_openai_moderation, approx_rows=1680),
@@ -223,7 +328,7 @@ DATASETS: Dict[str, DatasetSpec] = {
     "phtest": DatasetSpec("phtest", TIER_B, "furonghuang-lab/PHTest", None, "train",
                           norm_phtest, approx_rows=3260),
     "sorrybench": DatasetSpec("sorrybench", TIER_C, "sorry-bench/sorry-bench-202503", None, "train",
-                              norm_sorrybench, approx_rows=440),
+                              norm_sorrybench, approx_rows=440, gated=True),
     "saladbench": DatasetSpec("saladbench", TIER_C, "OpenSafetyLab/Salad-Data", "base_set", "train",
                               norm_saladbench, approx_rows=21318),
     "simplesafetytests": DatasetSpec("simplesafetytests", TIER_C, "Bertievidgen/SimpleSafetyTests", None, "test",
@@ -233,26 +338,46 @@ DATASETS: Dict[str, DatasetSpec] = {
     "jailbreakbench": DatasetSpec("jailbreakbench", TIER_D, "JailbreakBench/JBB-Behaviors", "behaviors", "harmful",
                                   norm_jailbreakbench, approx_rows=100),
     "strongreject": DatasetSpec("strongreject", TIER_D, "walledai/StrongREJECT", None, "train",
-                                norm_strongreject, approx_rows=313),
+                                norm_strongreject, approx_rows=313, gated=True),
     "inthewild_jailbreak": DatasetSpec("inthewild_jailbreak", TIER_D, "TrustAIRLab/in-the-wild-jailbreak-prompts",
                                        "jailbreak_2023_12_25", "train", norm_inthewild, approx_rows=1405),
     "multijail": DatasetSpec("multijail", TIER_E, "DAMO-NLP-SG/MultiJail", None, "train",
                              norm_multijail, approx_rows=3150),
-    "xsafety": DatasetSpec("xsafety", TIER_E, "ToxicityPrompts/XSafety", None, "train",
-                           norm_xsafety, approx_rows=28000),
-    "rtplx": DatasetSpec("rtplx", TIER_E, "ToxicityPrompts/RTP-LX", None, "train",
-                         norm_rtplx, approx_rows=28000),
-    "aya_redteam": DatasetSpec("aya_redteam", TIER_E, "CohereForAI/aya_redteaming", None, "train",
-                               norm_aya_redteam, approx_rows=7419),
+    "xsafety": DatasetSpec("xsafety", TIER_E, "ToxicityPrompts/XSafety", None, "test",
+                           norm_xsafety, approx_rows=28000,
+                           notes="commonsense category excluded; it is not a harm probe"),
+    "rtplx": DatasetSpec("rtplx", TIER_E, "ToxicityPrompts/RTP-LX", None, "test",
+                         norm_rtplx, approx_rows=28000,
+                         notes="labelled by mean annotator toxicity >= 3.0, not assumed unsafe"),
+    "aya_redteam": DatasetSpec("aya_redteam", TIER_E, "CohereForAI/aya_redteaming", None,
+                               AYA_SPLITS, norm_aya_redteam, approx_rows=7419,
+                               notes="split is a concatenation; there is no 'train' split"),
     "wildguard_response": DatasetSpec("wildguard_response", TIER_F, "allenai/wildguardmix", "wildguardtest", "test",
-                                      norm_wildguard_response, level="response", approx_rows=1725),
+                                      norm_wildguard_response, level="response", approx_rows=1725,
+                                      gated=True),
     "beavertails_response": DatasetSpec("beavertails_response", TIER_F, "PKU-Alignment/BeaverTails", None,
                                         "330k_test", norm_beavertails_response, level="response",
                                         approx_rows=33000),
     "lmsys_benign": DatasetSpec("lmsys_benign", TIER_A, "lmsys/lmsys-chat-1m", None, "train",
-                                norm_lmsys_benign, approx_rows=1000000,
-                                notes="gated; used only to build the realistic-traffic composite"),
+                                norm_lmsys_benign, approx_rows=1000000, gated=True,
+                                notes="gated (auto-approve); benign half of the realistic-traffic composite"),
+    "wildchat_benign": DatasetSpec("wildchat_benign", TIER_A, "allenai/WildChat-1M", None, "train",
+                                   norm_wildchat_benign, approx_rows=1000000,
+                                   notes="ungated stand-in for lmsys_benign in the composite"),
 }
+
+
+def gated_datasets() -> List[str]:
+    return sorted(name for name, spec in DATASETS.items() if spec.gated)
+
+
+def gated_urls() -> Dict[str, str]:
+    """Dataset page per gated repo, deduplicated -- one click each."""
+    urls = {}
+    for name, spec in DATASETS.items():
+        if spec.gated and spec.hf_id:
+            urls.setdefault(spec.hf_id, spec.hub_url)
+    return urls
 
 
 def by_tier(tier: str) -> List[str]:

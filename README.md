@@ -85,42 +85,96 @@ because a CPU/GPU hybrid is not comparable to a full offload.
 
 ---
 
-## Quick start
+## Setup
 
-Local CPU box:
+Ordered. Each step is checkable; do not skip to inference before step 6 passes.
 
-```bash
-python scripts/download_datasets.py --core
-python scripts/verify_scorer.py --model q4 --dataset xstest --n 40 --n-gpu-layers 0
-MODELS="bit-ladder" GPU_LAYERS=0 bash scripts/run_everything.sh
+**1 — Accept the four gated datasets.** One click each, granted instantly (they
+gate on `auto`, no manual review). Needed for Phases 4, 5 and 8, not for the
+core result.
+
+```
+https://huggingface.co/datasets/allenai/wildguardmix
+https://huggingface.co/datasets/sorry-bench/sorry-bench-202503
+https://huggingface.co/datasets/walledai/StrongREJECT
+https://huggingface.co/datasets/lmsys/lmsys-chat-1m
 ```
 
-RunPod (or any CUDA host):
+Phase 6 also needs `meta-llama/Llama-Guard-3-8B`, which is gated the same way.
+
+**2 — Authenticate.**
+
+```bash
+huggingface-cli login
+```
+
+**3 — Bootstrap the pod** (RunPod or any CUDA host). Puts the HF cache on the
+persistent volume, installs the backend-matched engine build, prints the
+environment fingerprint.
 
 ```bash
 VOLUME=/workspace bash scripts/setup_runpod.sh
-python scripts/download_datasets.py --core
-python scripts/verify_scorer.py --model q4 --dataset xstest --n 40
-MODELS="bit-ladder" RESUME=1 bash scripts/run_everything.sh
 ```
 
-`setup_runpod.sh` points `HF_HOME` at the persistent volume (container disk is
-wiped when the pod stops, and the full model set is ~145 GB of GGUF plus ~32 GB
-of safetensors), installs the CUDA engine build, and prints the environment
-fingerprint. `RESUME=1` makes a preempted pod resume instead of rescoring:
-`run_model.py` checkpoints the CSV every 50 rows and refuses to resume onto a
-prompt set that no longer matches.
+On the local CPU box instead: `pip install -r requirements.txt && bash scripts/install_engine.sh`.
 
-Before either, confirm the machine measures what you think it measures:
+**4 — (Not needed for this paper.)** Every model in scope is published on the
+hub, so no local quantization is required. The `build_toolchain.sh` /
+`build_missing_quants.py` path exists for the algorithm-axis follow-up, which
+needs `q4_0` — a file the upstream repo never published.
+
+**5 — Preflight.** Checks engine build, GPU offload support, NVML, HF auth,
+gated access, every model filename, disk headroom and template fingerprints.
+Exits non-zero on anything fatal.
+
+```bash
+python scripts/preflight.py --full
+```
+
+**6 — Smoke test.** Two precisions end to end, metrics printed.
 
 ```bash
 MODELS="q3 q4" N=40 bash scripts/smoke_test.sh
 ```
 
-Scores two precisions on 40 prompts and prints the environment fingerprint,
-safety metrics, and efficiency metrics side by side. On a GPU pod, check that
-`Device memory (VRAM delta)` roughly matches the GGUF size — if it does not,
-llama.cpp is not fully offloading and the timings mean nothing.
+On a GPU pod, confirm `Device memory (VRAM delta)` is close to the GGUF size —
+if it is not, llama.cpp is not fully offloading and no timing is meaningful.
+
+**7 — Prefetch weights.** Otherwise each model downloads lazily on first use,
+which puts a multi-gigabyte transfer inside the run: a pod interrupted mid-sweep
+re-fetches, and a network failure surfaces as a failed phase rather than a
+failed download.
+
+```bash
+python scripts/prefetch_models.py --check --models bit-ladder
+```
+
+```bash
+python scripts/prefetch_models.py --models bit-ladder
+```
+
+Weights land in `$MODEL_WEIGHTS_DIR` (`setup_runpod.sh` points it at the volume).
+`HF_HOME` alone is not enough — GGUFs are fetched with an explicit `cache_dir`,
+which takes precedence, so without this variable ~145 GB lands on the pod's
+ephemeral container disk and is lost when the pod stops.
+
+Group sizes: `bit-ladder` 49 GB, `algorithm-4bit` 24 GB, `algorithm-3bit` 15 GB,
+`all-families-ladder` 99 GB, everything 151 GB. Prefetch the groups for the
+phases you are about to run rather than the whole set; use `--evict` on
+`run_phase.py` if the volume cannot hold a group.
+
+**8 — Datasets, then run.**
+
+```bash
+python scripts/download_datasets.py --core
+```
+
+```bash
+MODELS="bit-ladder" RESUME=1 bash scripts/run_everything.sh
+```
+
+`RESUME=1` lets a preempted pod continue instead of rescoring: predictions are
+checkpointed every 50 rows, and a resume onto a changed prompt set is refused.
 
 Read `results/tables/gates.json` before doing anything else.
 
@@ -135,7 +189,7 @@ Read `results/tables/gates.json` before doing anything else.
 | 2 Threshold-free | `python evaluation/analyze.py` | C: AUROC gap < 0.02 with overlapping CIs |
 | 3 Calibration | included in `analyze.py` | D: recalibration collapses the gap |
 | 4 Scale | `python scripts/run_phase.py --phase 4 --evict` | replication across models and traffic |
-| 5 Algorithms | `python scripts/run_phase.py --phase 5 --evict` | do same-bit algorithms diverge? |
+| 5 Algorithms | *deferred to a follow-up paper* | do same-bit algorithms diverge? |
 | 5b imatrix | `python scripts/build_imatrix.py` | does safety calibration data help? |
 | 6 Mechanism | `python evaluation/layer_sweep.py --n-prompts 200` | is drift concentrated in few layers? |
 | 7 Mixed precision | `python scripts/build_mixed_precision.py --k 1 2 4 8` | Q3 memory, FP16 behaviour? |
@@ -153,9 +207,34 @@ until Gate D passes**, except the underpowered branch of Gate C.
 Keys are `family:precision`. Short aliases: `fp16 q8 q6 q5 q4 q3 q2` map to the 8B family.
 
 ```
-llama-guard-3-8b    fp16 bf16 q8_0 q6_k q5_k_m q5_k_s q4_k_m q4_k_s q4_0
-                    iq4_nl iq4_xs q3_k_l q3_k_m q3_k_s iq3_xs q2_k
+llama-guard-3-8b    fp16 bf16 q8_0 q6_k q5_k_m q5_k_s q4_k_m q4_0 iq4_xs
+                    q3_k_l q3_k_m q3_k_s iq3_xs q2_k
 qwen3guard-gen-8b   fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m q2_k
+
+**Scope of this paper: 14 models — the two bit ladders.**
+
+```
+llama-guard-3-8b    fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m q2_k
+qwen3guard-gen-8b   fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m q2_k
+```
+
+That is `all-families-ladder` (99 GB), the default for `preflight.py`,
+`prefetch_models.py` and `verify_models.py`. It answers one question: what does
+lower precision do to a guard's operating point, and does the pattern replicate
+across two architectures.
+
+The remaining seven registry entries — `bf16 q5_k_s q4_0 iq4_xs q3_k_l q3_k_s
+iq3_xs` — are **reserved for a follow-up paper** on the algorithm axis: at a
+fixed bit budget, does the compression method change the decision? They stay in
+the registry and `evaluation/gates.py` keeps a working test
+(`algorithm_axis_report`, McNemar + DeLong, Holm-corrected, per axis), so that
+work resumes from a known-good state. Nothing in the default path downloads or
+runs them, and their two claims read `NOT_TESTED` in `claims_to_evidence.csv`,
+which is the correct record for this paper.
+
+If you pick that work up: `q4_0` is not on the hub and must be built
+(`build_missing_quants.py`), and consider restoring `q4_k_s` and `iq4_nl` —
+dropped here as duplicates, but useful there as within-family controls.
 ```
 
 Group specs: `bit-ladder`, `algorithm-4bit`, `algorithm-3bit`, `all-families-ladder`,
@@ -172,15 +251,15 @@ best-effort; if one 404s the loader lists what the repo actually contains.
 
 ## Datasets
 
-24 specs across six tiers in `scripts/datasets_registry.py`. Only HarmBench and XSTest are
-verified; the rest need probing before use:
+25 specs across six tiers in `scripts/datasets_registry.py`. All 20 ungated specs are
+verified to load and normalize; the 5 gated ones need step 1 above. Re-probe any time:
 
 ```bash
 python scripts/verify_datasets.py --tier A
 ```
 
-`LOAD_FAIL` means a wrong id/config/split or a gated dataset. `NORMALIZER` means it loads but
-the field names differ — fix its normalizer. Then:
+`GATED` means the terms are not accepted (step 1). `LOAD_FAIL` means a wrong id/config/split.
+`NORMALIZER` means it loads but the field names differ. Then:
 
 ```bash
 python scripts/download_datasets.py --tier A
@@ -194,7 +273,10 @@ Tiers: **A** core safety · **B** over-refusal · **C** category/severity · **D
 
 ## Disk management
 
-The full model set exceeds 100 GB. Use eviction:
+Weights go to `$MODEL_WEIGHTS_DIR`, defaulting to `models/weights`. Set it to a
+persistent path on any pod.
+
+The full model set is ~151 GB. Either prefetch per group (step 7) or evict:
 
 ```bash
 python scripts/run_phase.py --phase 5 --evict --n-gpu-layers 0
@@ -222,7 +304,10 @@ scripts/
   run_phase.py           orchestrate a phase, with disk checks and eviction
   verify_scorer.py       Gate B
   label_audit.py         Gate A label-noise audit
+  preflight.py           environment, models, datasets, templates: all checks
+  prefetch_models.py     download weights ahead of a run
   smoke_test.sh          two precisions end to end, metrics printed
+  build_missing_quants.py  q4_0 / bf16, absent from the upstream repo
   benchmark_throughput.py single-stream prompts/s and prefill tokens/s
   install_engine.sh      backend-matched llama-cpp-python build
   setup_runpod.sh        pod bootstrap: volume, engine, fingerprint
@@ -264,6 +349,10 @@ margin_distributions, reliability, flip_rate_vs_distance, memory_pareto, uncerta
 
 Criteria are fixed in `evaluation/gates.py` before any data is seen.
 
+This paper makes one claim: quantization shifts a guard's operating point. The second
+claim — that the algorithm matters at fixed bit width — is deferred, and its gate is
+implemented but reads `NOT_TESTED`.
+
 **A — validity.** Non-monotonic differences still significant after Holm correction, and not
 monotonic in bit width. If it fails, the finding becomes "prompt formatting explains reported
 quantization-safety effects."
@@ -288,20 +377,41 @@ Never write a claim the table has not licensed.
 
 ## Known gaps
 
-- Qwen3Guard template in `models/templates.py` is a best guess — verify against its model card
-  before trusting any Qwen result.
-- GGUF filenames for `fp16` and the Qwen family are unverified; the loader reports the real
-  file list on failure.
-- 22 of 24 dataset specs are unverified. Run `verify_datasets.py` first.
 - The layer sweep uses RTN fake quantization, which does not reproduce k-quant block
   structure. It ranks layers; Phase 7 validates the ranking with real GGUF builds. This
   caveat belongs in the methods section.
 - The layer sweep runs in bfloat16 (`--dtype auto`; float16 on MPS). float32 is rejected
   outright: an 8B model needs ~32 GB in float32, beyond the experiment hardware, and the
-  extra mantissa is irrelevant to a 3-4 bit RTN perturbation. bfloat16 is preferred over
-  float16 because it keeps float32's exponent range.
+  extra mantissa is irrelevant to a 3-4 bit RTN perturbation whose relative Frobenius
+  error is 0.11 (4-bit) to 0.22 (3-bit) against bfloat16's 0.0017.
 - `benchmark_throughput.py` measures a single request stream. Concurrent batched serving
   would need llama.cpp's server with continuous batching — a different system and a
   different experiment. Say "single-stream" in any throughput claim.
-- Phase 6 pulls the gated `meta-llama/Llama-Guard-3-8B`; the pod needs
-  `huggingface-cli login` or `HF_TOKEN` with the license accepted.
+- Qwen3Guard emits three labels. `--controversial-policy` (default `strict`) decides how
+  Controversial folds into the binary decision; all three logits are written to the
+  predictions CSV so the choice can be revisited without re-running. "Controversial" is
+  not a single token in Qwen's vocabulary — it starts with the shared prefix `" Cont"` —
+  so its logit is a slight over-estimate. The safe/unsafe tokens are clean, so the binary
+  margin is unaffected.
+- Three label mappings in `datasets_registry.py` are judgement calls, each marked with a
+  comment at its normalizer: PHTest drops its `controversial` class rather than forcing a
+  binary label; XSafety excludes its `commonsense` category, which is not a harm probe;
+  RTP-LX binarizes its 1-5 mean annotator toxicity at 3.0. Each changes the base rate of
+  its dataset and belongs in the methods section.
+
+## Template provenance
+
+Both prompt templates are transcribed from the model's own `chat_template` — the GGUF
+metadata for Llama Guard 3, `tokenizer_config.json` for Qwen3Guard — not from prose docs.
+This matters because Gate A asks whether prompt formatting explains reported
+quantization-safety effects, and an approximated template would make that untestable.
+
+Each template records its deviations in `models/templates.py`. There is one, common to
+both: we score the token after the prompt rather than generating, so a fixed continuation
+is appended to put the scoring position exactly on the label. Everything before that point
+is byte-identical to `apply_chat_template`.
+
+**Any predictions collected before this correction are not comparable.** The Llama Guard
+template was missing category S14 (Code Interpreter Abuse) and the Qwen template was a
+guess that omitted the safety-policy block and the empty `<think>` block. Both fingerprints
+changed; `template_fingerprint` in every prediction file records which was used.

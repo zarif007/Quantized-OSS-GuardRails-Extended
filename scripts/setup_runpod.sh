@@ -26,9 +26,16 @@ fi
 # safetensors for the layer sweep.
 export HF_HOME="$VOLUME/hf"
 export HF_HUB_ENABLE_HF_TRANSFER=1
-mkdir -p "$HF_HOME"
-echo "export HF_HOME=$VOLUME/hf" >> ~/.bashrc
-echo "export HF_HUB_ENABLE_HF_TRANSFER=1" >> ~/.bashrc
+# GGUF weights are fetched with an explicit cache_dir, which takes precedence
+# over HF_HOME, so they need their own variable or ~145 GB lands on the
+# container disk and is lost when the pod stops.
+export MODEL_WEIGHTS_DIR="$VOLUME/weights"
+mkdir -p "$HF_HOME" "$MODEL_WEIGHTS_DIR"
+{
+  echo "export HF_HOME=$VOLUME/hf"
+  echo "export HF_HUB_ENABLE_HF_TRANSFER=1"
+  echo "export MODEL_WEIGHTS_DIR=$VOLUME/weights"
+} >> ~/.bashrc
 
 FREE_GB=$(df -BG "$VOLUME" | awk 'NR==2 {gsub("G","",$4); print $4}')
 echo ""
@@ -76,6 +83,7 @@ echo " Gated models (Phase 6 only) need a token:"
 echo "   huggingface-cli login      # or: export HF_TOKEN=hf_..."
 echo ""
 echo " Then:"
+echo "   python scripts/prefetch_models.py --models bit-ladder"
 echo "   python scripts/download_datasets.py --core"
 echo "   python scripts/verify_scorer.py --model q4 --dataset xstest --n 40"
 echo "   MODELS=bit-ladder bash scripts/run_everything.sh"

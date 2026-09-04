@@ -27,7 +27,7 @@ def materialize(name: str, force: bool = False, max_rows: int = None) -> str:
     from datasets import load_dataset
 
     os.makedirs(NORMALIZED_DIR, exist_ok=True)
-    kwargs = {"cache_dir": CACHE_DIR}
+    kwargs = {"cache_dir": CACHE_DIR, "token": os.environ.get("HF_TOKEN") or None}
     if spec.config:
         ds = load_dataset(spec.hf_id, spec.config, split=spec.split, **kwargs)
     else:

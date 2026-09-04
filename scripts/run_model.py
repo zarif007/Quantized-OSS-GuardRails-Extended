@@ -25,6 +25,8 @@ ERROR_ROW = {
     "p_unsafe": float("nan"),
     "logit_safe": float("nan"),
     "logit_unsafe": float("nan"),
+    "logit_controversial": float("nan"),
+    "p_controversial": float("nan"),
     "margin": float("nan"),
     "raw_output": "",
     "eval_tokens": 0,
@@ -106,6 +108,7 @@ def run_model(
     n_gpu_layers: int = -1,
     n_batch: int = None,
     flash_attn: bool = False,
+    controversial_policy: str = "strict",
     no_prefix_cache: bool = False,
     local_path: str = None,
     label: str = None,
@@ -165,6 +168,7 @@ def run_model(
             n_gpu_layers=n_gpu_layers,
             n_batch=n_batch,
             flash_attn=flash_attn,
+            controversial_policy=controversial_policy,
             n_ctx=n_ctx,
             use_prefix_cache=not no_prefix_cache,
             config_override=config if local_path else None,
@@ -187,6 +191,8 @@ def run_model(
         sys.exit(3)
 
     print(f"[{tag}] Label tokens:\n{model.token_report()}")
+    if model.template.is_ternary:
+        print(f"[{tag}] Controversial policy: {controversial_policy}")
     print(f"[{tag}] Cacheable prefix: {model.prefix_token_count()} tokens")
 
     fingerprint = env_fingerprint(n_gpu_layers)
@@ -243,6 +249,8 @@ def run_model(
             "p_unsafe": scored["p_unsafe"],
             "logit_safe": scored["logit_safe"],
             "logit_unsafe": scored["logit_unsafe"],
+            "logit_controversial": scored.get("logit_controversial", float("nan")),
+            "p_controversial": scored.get("p_controversial", float("nan")),
             "margin": scored["margin"],
             "raw_output": scored["raw_output"],
             "latency_sec": latency_sec,
@@ -258,6 +266,7 @@ def run_model(
             "language": getattr(row, "language", "en"),
             "level": getattr(row, "level", "prompt"),
             "template_fingerprint": meta["template_fingerprint"],
+            "controversial_policy": meta.get("controversial_policy"),
             "backend": backend,
             "gpu_name": fingerprint.get("gpu_name"),
             "env_hash": env_hash,
@@ -354,6 +363,10 @@ if __name__ == "__main__":
     parser.add_argument("--n-batch", type=int, default=None,
                         help="llama.cpp batch size; affects prefill throughput")
     parser.add_argument("--flash-attn", action="store_true")
+    parser.add_argument("--controversial-policy", default="strict",
+                        choices=["strict", "lenient", "binary"],
+                        help="how Qwen3Guard's third label folds into the binary "
+                             "decision; ignored by binary guards")
     parser.add_argument("--no-prefix-cache", action="store_true")
     parser.add_argument("--local-path", default=None)
     parser.add_argument("--label", default=None)
@@ -383,6 +396,7 @@ if __name__ == "__main__":
         n_gpu_layers=args.n_gpu_layers,
         n_batch=args.n_batch,
         flash_attn=args.flash_attn,
+        controversial_policy=args.controversial_policy,
         no_prefix_cache=args.no_prefix_cache,
         local_path=args.local_path,
         label=args.label,

@@ -194,7 +194,8 @@ CLAIMS = [
     ("Fixed-threshold evaluation can misrank precisions", "base_rate_crossover", [True]),
     ("Realistic prevalence can reverse benchmark rankings", "realistic_traffic_reversal", [True]),
     ("Threshold recalibration recovers the difference for free", "gate_d", ["REPAIRED"]),
-    ("Bit width is not the only relevant variable", "algorithm_axis_divergence", [True]),
+    ("Bit width is not the only relevant variable (4-bit)", "algorithm_axis_4bit", ["DIVERGES"]),
+    ("Bit width is not the only relevant variable (3-bit)", "algorithm_axis_3bit", ["DIVERGES"]),
     ("Calibration data affects boundary preservation", "imatrix_divergence", [True]),
     ("A small subset of layers drives the drift", "layer_concentration", [True]),
     ("Safety-aware mixed precision beats uniform quantization", "mixed_precision_pareto", [True]),
@@ -241,6 +242,13 @@ def layer_concentration(sweep: pd.DataFrame, top_k: int = 4) -> Dict:
 
 def algorithm_divergence(summary: pd.DataFrame, algorithm_keys: List[str],
                          tolerance: float = 0.02) -> Dict:
+    """
+    Legacy spread-only check, kept so older callers keep working.
+
+    Prefer algorithm_axis_report: a raw max-minus-min spread cannot separate a
+    real difference from sampling noise, and the ladder claim is held to a
+    significance standard, so this one must be too.
+    """
     sub = summary[summary["model"].isin(algorithm_keys)]
     if len(sub) < 2 or "auroc" not in sub.columns:
         return {"diverges": None}
@@ -254,3 +262,96 @@ def algorithm_divergence(summary: pd.DataFrame, algorithm_keys: List[str],
         "flag_rate_spread": spread_flag,
         "tolerance": tolerance,
     }
+
+
+def algorithm_axis_report(summary: pd.DataFrame, pairwise: pd.DataFrame,
+                          axis_keys: List[str], axis_name: str,
+                          tolerance: float = 0.02) -> tuple:
+    """
+    Does the compression algorithm matter at a fixed bit budget?
+
+    This is the second claim of the paper, and it is held to the same standard
+    as the first: a difference counts only if a paired test survives multiple-
+    comparison correction.  McNemar tests the decisions the models actually
+    make; DeLong tests whether their ranking ability differs.  Both come from
+    the pairwise table analyze.py already computes for every model pair, so no
+    new statistics are introduced here -- only the subset that shares a bit
+    budget is selected.
+
+    The bit budgets are close but not identical (iq4_xs is ~4.25 bits against
+    q4_k_m's ~4.8), so `bits_spread` is reported.  That confound has a
+    direction worth stating in the write-up: if the *smaller* model wins, the
+    algorithm effect is understated by the size difference, not manufactured
+    by it.
+
+    Returns (per-model table, verdict dict).
+    """
+    sub = summary[summary["model"].isin(axis_keys)].copy()
+    if len(sub) < 2:
+        return pd.DataFrame(), {
+            "axis": axis_name,
+            "status": "NOT_TESTED",
+            "reason": f"only {len(sub)} of {len(axis_keys)} axis models present",
+            "diverges": None,
+        }
+
+    tpr_col = "tpr_at_fpr_05" if "tpr_at_fpr_05" in sub.columns else "safety_rate"
+    keep = [c for c in ["model", "algorithm", "bits", "size_gb", tpr_col, "flag_rate",
+                        "auroc", "auroc_ci_lo", "auroc_ci_hi", "ece", "safety_rate",
+                        "false_positive_rate"] if c in sub.columns]
+    table = sub[keep].copy()
+    table.insert(0, "axis", axis_name)
+
+    # Restrict the already-corrected pairwise tests to within-axis pairs.
+    pairs = pd.DataFrame()
+    if not pairwise.empty and {"model_a", "model_b"}.issubset(pairwise.columns):
+        mask = pairwise["model_a"].isin(axis_keys) & pairwise["model_b"].isin(axis_keys)
+        pairs = pairwise[mask].copy()
+
+    def _any_significant(column):
+        if pairs.empty or column not in pairs.columns:
+            return None
+        values = pairs[column].dropna()
+        return bool(values.any()) if len(values) else None
+
+    decisions_differ = _any_significant("mcnemar_significant")
+    ranking_differs = _any_significant("delong_significant")
+
+    spread_tpr = float(sub[tpr_col].max() - sub[tpr_col].min())
+    spread_flag = (float(sub["flag_rate"].max() - sub["flag_rate"].min())
+                   if "flag_rate" in sub.columns else float("nan"))
+    spread_auroc = (float(sub["auroc"].max() - sub["auroc"].min())
+                    if "auroc" in sub.columns else float("nan"))
+    bits_spread = (float(sub["bits"].max() - sub["bits"].min())
+                   if "bits" in sub.columns else float("nan"))
+
+    if decisions_differ:
+        status = "DIVERGES"
+        reason = ("algorithms at the same bit budget make significantly different "
+                  "decisions after correction; bit width alone does not describe "
+                  "a quantized guard")
+    elif decisions_differ is False and spread_tpr < tolerance:
+        status = "EQUIVALENT"
+        reason = "no significant pairwise difference and spread within tolerance"
+    else:
+        status = "UNDERPOWERED"
+        reason = ("spread present but no pair survives correction; more prompts "
+                  "needed before this claim can be made")
+
+    verdict = {
+        "axis": axis_name,
+        "status": status,
+        "reason": reason,
+        "diverges": status == "DIVERGES",
+        "n_algorithms": int(len(sub)),
+        "algorithms": sorted(sub["algorithm"].unique()) if "algorithm" in sub.columns else [],
+        "n_pairs_tested": int(len(pairs)),
+        "decisions_differ": decisions_differ,
+        "ranking_differs": ranking_differs,
+        f"{tpr_col}_spread": spread_tpr,
+        "flag_rate_spread": spread_flag,
+        "auroc_spread": spread_auroc,
+        "bits_spread": bits_spread,
+        "tolerance": tolerance,
+    }
+    return table, verdict

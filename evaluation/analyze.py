@@ -31,6 +31,7 @@ from evaluation.deployment import (
 )
 from evaluation.disagreement import agreement_matrix, borderline_subset, flip_report
 from evaluation.gates import (
+    algorithm_axis_report,
     algorithm_divergence,
     base_rate_crossover,
     claims_table,
@@ -50,7 +51,13 @@ from evaluation.threshold_analysis import (
     threshold_sweep,
     to_labels,
 )
-from models.registry import ALGORITHM_AXIS_4BIT, DEFAULT_FAMILY, get_config, sort_keys
+from models.registry import (
+    ALGORITHM_AXIS_3BIT,
+    ALGORITHM_AXIS_4BIT,
+    DEFAULT_FAMILY,
+    get_config,
+    sort_keys,
+)
 
 BUDGETS_GB = [3.5, 4.0, 5.0, 6.0, 7.0, 9.0, 17.0]
 
@@ -422,6 +429,19 @@ def main():
     sweep = pd.read_csv(args.layer_sweep) if os.path.exists(args.layer_sweep) else pd.DataFrame()
     from evaluation.gates import layer_concentration
 
+    # Claim 2: at a fixed bit budget, does the algorithm change the decision?
+    # Both axes are evaluated; the 3-bit one previously had no test at all.
+    axis_tables, axis_verdicts = [], {}
+    for axis_name, axis_precisions in (("4bit", ALGORITHM_AXIS_4BIT),
+                                       ("3bit", ALGORITHM_AXIS_3BIT)):
+        axis_keys = [f"{DEFAULT_FAMILY}:{p}" for p in axis_precisions]
+        table, verdict = algorithm_axis_report(summary, pairs, axis_keys, axis_name)
+        axis_verdicts[axis_name] = verdict
+        if not table.empty:
+            axis_tables.append(table)
+    if axis_tables:
+        save(pd.concat(axis_tables, ignore_index=True), args.tables_dir, "algorithm_axis")
+
     algo_keys = [f"{DEFAULT_FAMILY}:{p}" for p in ALGORITHM_AXIS_4BIT]
     evidence = {
         "gate_a": verdicts["gate_a"]["status"],
@@ -430,7 +450,8 @@ def main():
         "base_rate_crossover": crossover["crossover_observed"],
         "realistic_traffic_reversal": crossover["crossover_observed"]
         if "realistic_traffic" in set(combined["dataset"]) else None,
-        "algorithm_axis_divergence": algorithm_divergence(summary, algo_keys).get("diverges"),
+        "algorithm_axis_4bit": axis_verdicts["4bit"]["status"],
+        "algorithm_axis_3bit": axis_verdicts["3bit"]["status"],
         "layer_concentration": layer_concentration(sweep).get("concentrated"),
         "imatrix_divergence": None,
         "mixed_precision_pareto": None,
@@ -453,7 +474,8 @@ def main():
               "n_rows": len(combined), "scored": scored, "reference_model": reference,
               "efficiency_metrics_comparable": efficiency_ok,
               "memory_basis": args.memory_col,
-              **verdicts, "base_rate_crossover": crossover, "evidence": evidence}
+              **verdicts, "algorithm_axis": axis_verdicts,
+              "base_rate_crossover": crossover, "evidence": evidence}
     with open(os.path.join(args.tables_dir, "gates.json"), "w") as fh:
         json.dump(report, fh, indent=2, default=str)
 
@@ -462,6 +484,14 @@ def main():
         v = verdicts[key]
         print(f"  {v['gate']}: {v['status']:<22} {v.get('reason','')}")
     print(f"  HW: {hardware['status']:<22} {hardware['reason']}")
+
+    print("\n=== Algorithm axis (same bits, different method) ===")
+    for axis_name, v in axis_verdicts.items():
+        print(f"  {axis_name}: {v['status']:<16} {v['reason']}")
+        if v["status"] != "NOT_TESTED":
+            print(f"        {v['n_algorithms']} algorithms, {v['n_pairs_tested']} pairs | "
+                  f"TPR spread {v.get('tpr_at_fpr_05_spread', v.get('safety_rate_spread', float('nan'))):.4f} | "
+                  f"bits spread {v['bits_spread']:.2f}")
 
     print("\n=== Base-rate winners ===")
     for pi, winner in crossover["winners"].items():

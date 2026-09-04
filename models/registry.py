@@ -13,10 +13,8 @@ LLAMA_8B_PRECISIONS = {
     "q5_k_m":  {"file": "Llama-Guard-3-8B.Q5_K_M.gguf", "size_gb": 5.73,  "bits": 5.7,  "algorithm": KQUANT},
     "q5_k_s":  {"file": "Llama-Guard-3-8B.Q5_K_S.gguf", "size_gb": 5.60,  "bits": 5.5,  "algorithm": KQUANT},
     "q4_k_m":  {"file": "Llama-Guard-3-8B.Q4_K_M.gguf", "size_gb": 4.92,  "bits": 4.8,  "algorithm": KQUANT},
-    "q4_k_s":  {"file": "Llama-Guard-3-8B.Q4_K_S.gguf", "size_gb": 4.69,  "bits": 4.6,  "algorithm": KQUANT},
     "q4_0":    {"file": "Llama-Guard-3-8B.Q4_0.gguf",   "size_gb": 4.66,  "bits": 4.5,  "algorithm": LEGACY},
     "iq4_xs":  {"file": "Llama-Guard-3-8B.IQ4_XS.gguf", "size_gb": 4.45,  "bits": 4.25, "algorithm": IQUANT},
-    "iq4_nl":  {"file": "Llama-Guard-3-8B.IQ4_NL.gguf", "size_gb": 4.68,  "bits": 4.5,  "algorithm": IQUANT},
     "q3_k_l":  {"file": "Llama-Guard-3-8B.Q3_K_L.gguf", "size_gb": 4.32,  "bits": 4.2,  "algorithm": KQUANT},
     "q3_k_m":  {"file": "Llama-Guard-3-8B.Q3_K_M.gguf", "size_gb": 3.93,  "bits": 3.9,  "algorithm": KQUANT},
     "q3_k_s":  {"file": "Llama-Guard-3-8B.Q3_K_S.gguf", "size_gb": 3.66,  "bits": 3.6,  "algorithm": KQUANT},
@@ -68,12 +66,26 @@ ALIASES = {
 
 PRECISION_ORDER = [
     "fp16", "bf16", "q8_0", "q6_k", "q5_k_m", "q5_k_s",
-    "q4_k_m", "q4_k_s", "q4_0", "iq4_nl", "iq4_xs",
+    "q4_k_m", "q4_0", "iq4_xs",
     "q3_k_l", "q3_k_m", "q3_k_s", "iq3_xs", "q2_k",
 ]
 
+# Scope of THIS paper: the two bit ladders, 14 models.  The question is what
+# lower precision does to a guard's operating point.
+ACTIVE_GROUP = "all-families-ladder"
+
 BIT_LADDER = ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]
-ALGORITHM_AXIS_4BIT = ["q4_0", "q4_k_s", "q4_k_m", "iq4_nl", "iq4_xs"]
+
+# Reserved for the follow-up paper on the algorithm axis ("at a fixed bit
+# budget, does the compression method change the decision?").  These stay in
+# the registry, and evaluation/gates.py keeps a working test for them, so that
+# work resumes from a known-good state -- but nothing in the default path
+# downloads or runs them.  Their claims read NOT_TESTED in
+# claims_to_evidence.csv, which is the correct record for this paper.
+RESERVED_PRECISIONS = ["bf16", "q5_k_s", "q4_0", "iq4_xs", "q3_k_l", "q3_k_s", "iq3_xs"]
+# One representative per algorithm family at ~4 bits: legacy round-to-nearest,
+# k-quant, and the IQ codebook scheme.
+ALGORITHM_AXIS_4BIT = ["q4_0", "q4_k_m", "iq4_xs"]
 ALGORITHM_AXIS_3BIT = ["q3_k_s", "q3_k_m", "q3_k_l", "iq3_xs"]
 
 
