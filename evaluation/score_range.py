@@ -45,7 +45,18 @@ NARROW_FRACTION = 0.80
 
 # Below this many distinct interior scores there are too few candidate cuts for
 # TPR-at-target-FPR to land near the target it was asked for.
+#
+# This is an ABSOLUTE count, so it is only meaningful once the sample is large
+# enough to produce that many interior points in the first place.  A 40-prompt
+# smoke test with half its scores pinned has ~20 interior prompts and cannot
+# clear the bar however well behaved the guard is -- applying it there reports
+# a healthy model as POLARIZED.  Guarded by MIN_N_FOR_RESOLUTION below.
 MIN_INTERIOR_POINTS = 20
+
+# Under this many scored prompts the resolution criterion is not evaluated and
+# the verdict is UNDERSAMPLED unless the pinning alone is damning.  Pinning is
+# a fraction and stays meaningful at any n; counting distinct values does not.
+MIN_N_FOR_RESOLUTION = 200
 
 
 def score_range(df: pd.DataFrame) -> Dict[str, float]:
@@ -82,8 +93,21 @@ def score_range(df: pd.DataFrame) -> Dict[str, float]:
             out["margin_iqr"] = float(np.subtract(*np.percentile(m, [75, 25])))
             out["margin_abs_median"] = float(np.median(np.abs(m)))
 
-    if frac_pinned >= POLARIZED_FRACTION or n_interior_unique < MIN_INTERIOR_POINTS:
+    # Of the prompts that are not pinned, how many are distinguishable from one
+    # another?  1.0 means every interior prompt has its own score, which is
+    # full resolution whatever the sample size.
+    out["interior_resolution"] = (
+        n_interior_unique / interior.size if interior.size else float("nan"))
+
+    low_resolution = (p.size >= MIN_N_FOR_RESOLUTION
+                      and n_interior_unique < MIN_INTERIOR_POINTS)
+
+    if frac_pinned >= POLARIZED_FRACTION or low_resolution:
         out["verdict"] = "POLARIZED"
+    elif p.size < MIN_N_FOR_RESOLUTION:
+        # Pinning is not damning and the sample is too small to judge
+        # resolution.  Say so rather than guessing in either direction.
+        out["verdict"] = "UNDERSAMPLED"
     elif frac_pinned >= NARROW_FRACTION:
         out["verdict"] = "NARROW"
     else:
@@ -113,6 +137,11 @@ def report(combined: pd.DataFrame) -> Dict[str, object]:
             f"values). AUROC, TOST and TPR-at-target-FPR are not meaningful here; "
             f"use a harder or more borderline prompt set before the sweep"
         )
+    elif "UNDERSAMPLED" in verdicts:
+        status = "UNDERSAMPLED"
+        reason = (f"fewer than {MIN_N_FOR_RESOLUTION} scored prompts, so resolution "
+                  f"cannot be judged; pinning alone is not damning. Re-run with more "
+                  f"prompts before trusting this either way")
     elif "NARROW" in verdicts:
         status = "NARROW"
         reason = (f"some models pin >= {NARROW_FRACTION:.0%} of scores at the extremes; "
@@ -130,8 +159,9 @@ def print_report(combined: pd.DataFrame, title: str = "Score dynamic range") -> 
     if table.empty:
         print("  no predictions")
         return r["status"]
-    cols = [c for c in ("model", "n", "frac_pinned", "n_interior_unique",
-                        "p_iqr", "margin_abs_median", "verdict") if c in table.columns]
+    cols = [c for c in ("model", "n", "frac_pinned", "n_interior", "n_interior_unique",
+                        "interior_resolution", "margin_abs_median", "verdict")
+            if c in table.columns]
     print(table[cols].round(4).to_string(index=False))
     print(f"  {r['status']}: {r['reason']}")
     if r["status"] == "POLARIZED":
