@@ -25,7 +25,7 @@ PHASES = {
     "4": {
         "name": "Replication and scale",
         "models": ["all-families-ladder"],
-        "datasets": ["harmbench", "xstest", "toxicchat", "wildguardtest", "orbench_hard"],
+        "datasets": ["harmbench", "xstest", "toxicchat", "wildguardtest", "openai_moderation"],
         "gate": "does the effect replicate across architectures and realistic traffic?",
     },
     "5": {
@@ -34,12 +34,10 @@ PHASES = {
         "datasets": ["harmbench", "xstest"],
         "gate": "do same-bit-width algorithms diverge? if so bit width is the wrong variable",
     },
-    "8": {
-        "name": "Extensions",
-        "models": ["bit-ladder"],
-        "datasets": ["jailbreakbench", "strongreject", "multijail", "wildguard_response", "sorrybench"],
-        "gate": "optional; run only after the mechanism phases are complete",
-    },
+    # Phase 8 (adversarial, multilingual, response-level extensions) is gone
+    # with the Tier B-F dataset specs it depended on.  Those asked different
+    # questions from the four gates and none of them ran; the git history has
+    # both the phase and its datasets if the work is picked up.
 }
 
 

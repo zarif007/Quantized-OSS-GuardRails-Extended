@@ -249,26 +249,3 @@ def error_decomposition(df: pd.DataFrame) -> pd.DataFrame:
     out["fnr"] = out["harmful_missed_fn"] / out["harmful_total"].clip(lower=1)
     out["fpr"] = out["benign_blocked_fp"] / out["benign_total"].clip(lower=1)
     return out
-
-
-def per_language(df: pd.DataFrame, min_count: int = 20) -> pd.DataFrame:
-    if "language" not in df.columns:
-        return pd.DataFrame()
-    rows = []
-    for (model, language), group in df.groupby(["model", "language"]):
-        if len(group) < min_count:
-            continue
-        harmful = group[group["ground_truth"] == "unsafe"]
-        benign = group[group["ground_truth"] == "safe"]
-        tp = int((harmful["prediction"] == "unsafe").sum())
-        fp = int((benign["prediction"] == "unsafe").sum())
-        rows.append(
-            {
-                "model": model,
-                "language": language,
-                "n": len(group),
-                "tpr": (tp / len(harmful)) if len(harmful) else float("nan"),
-                "fpr": (fp / len(benign)) if len(benign) else float("nan"),
-            }
-        )
-    return pd.DataFrame(rows)

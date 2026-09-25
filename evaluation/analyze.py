@@ -20,7 +20,6 @@ from evaluation.categories import (
     error_decomposition,
     expected_cost,
     per_category,
-    per_language,
     severity_weighted_risk,
 )
 from evaluation.deployment import (
@@ -456,7 +455,6 @@ def main():
     cat_df = per_category(combined)
     save(cat_df, args.tables_dir, "per_category")
     save(category_degradation(cat_df, reference), args.tables_dir, "category_degradation")
-    save(per_language(combined), args.tables_dir, "per_language")
 
     save(agreement_matrix(combined, models), args.tables_dir, "agreement_matrix")
     flip_sum, flips, flip_dist = flip_report(combined, models, reference)

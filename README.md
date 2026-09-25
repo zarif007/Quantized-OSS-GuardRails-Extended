@@ -207,12 +207,21 @@ Read `results/tables/gates.json` before doing anything else.
 | 5b imatrix | `python scripts/build_imatrix.py` | does safety calibration data help? |
 | 6 Mechanism | `python evaluation/layer_sweep.py --n-prompts 200` | is drift concentrated in few layers? |
 | 7 Mixed precision | `python scripts/build_mixed_precision.py --k 1 2 4 8` | Q3 memory, FP16 behaviour? |
-| 8 Extensions | `python scripts/run_phase.py --phase 8` | adversarial, multilingual, response-level |
 | 9 Deployment | included in `analyze.py` | safety per GB, cascade |
 | 9b Throughput | `python scripts/benchmark_throughput.py --models bit-ladder` | single-stream prompts/s and prefill tokens/s |
 
-Phases 0–3 run on the 650 prompts you already have. **No dataset downloads are authorised
-until Gate D passes**, except the underpowered branch of Gate C.
+Phases 0–3 run on the 650 prompts committed to git. The other three datasets
+scale the sample so Gate C's equivalence test has the power to return a verdict
+rather than `UNDERPOWERED`. The full run is:
+
+```bash
+MODELS="all-families-ladder" SUBSET=1500 RESUME=1 \
+  DATASETS="harmbench xstest toxicchat wildguardtest openai_moderation" \
+  bash scripts/run_everything.sh
+```
+
+5,150 prompts x 12 models = 61,800 scored rows, roughly five hours on a 4090
+after the 92.5 GB weight download.
 
 ---
 
@@ -272,8 +281,25 @@ best-effort; if one 404s the loader lists what the repo actually contains.
 
 ## Datasets
 
-25 specs across six tiers in `scripts/datasets_registry.py`. All 20 ungated specs are
-verified to load and normalize; the 5 gated ones need step 1 above. Re-probe any time:
+Five specs in `scripts/datasets_registry.py`, all prompt-level English safety:
+
+| Dataset | Rows | Role |
+|---|---:|---|
+| `harmbench` | 200 | harmful prompts; committed to git |
+| `xstest` | 450 | benign-but-borderline; committed to git |
+| `toxicchat` | 5,083 | real user traffic at a realistic low base rate |
+| `wildguardtest` | 1,725 | standard guard benchmark; **gated** (auto-approve) |
+| `openai_moderation` | 1,680 | standard moderation benchmark |
+
+They all ask one question — given a prompt, is it harmful? — so pooling them is
+legitimate and the pooled AUROC means something. The registry previously held
+25 specs across six tiers (over-refusal, category/severity, adversarial,
+multilingual, response-level). Those answered Phase 8 questions, fed none of
+the four gates, and were never run; they were removed rather than left
+declared but unused. The git history has them.
+
+Probe before downloading — checks every spec loads and normalizes without
+pulling the data:
 
 ```bash
 python scripts/verify_datasets.py --tier A
@@ -286,9 +312,6 @@ python scripts/verify_datasets.py --tier A
 python scripts/download_datasets.py --tier A
 python scripts/download_datasets.py --composite --composite-base-rate 0.05
 ```
-
-Tiers: **A** core safety · **B** over-refusal · **C** category/severity · **D** adversarial ·
-**E** multilingual · **F** response-level.
 
 ---
 
@@ -358,7 +381,7 @@ evaluation/
 
 `results/tables/` — environments, throughput, summary_metrics, pairwise_tests,
 base_rate_sensitivity, per_dataset,
-recalibration, error_decomposition, per_category, category_degradation, per_language,
+recalibration, error_decomposition, per_category, category_degradation,
 severity_weighted_risk, expected_cost, agreement_matrix, flip_summary,
 flip_rate_by_distance, borderline_examples, safety_per_gb, memory_pareto, iso_memory,
 uncertainty_cascade, claims_to_evidence, gates.json
