@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from evaluation.calibration import recalibrate, reliability_curve
+from evaluation.calibration import calibration_decomposition, recalibrate, reliability_curve
 from evaluation.categories import (
     category_degradation,
     error_decomposition,
@@ -32,6 +32,9 @@ from evaluation.deployment import (
 from evaluation.disagreement import agreement_matrix, borderline_subset, flip_report
 from evaluation.gates import (
     algorithm_axis_report,
+    calibration_decomposition_report,
+    family_of,
+    peak_improvement,
     algorithm_divergence,
     base_rate_crossover,
     claims_table,
@@ -119,18 +122,63 @@ def pairwise_tests(combined, models):
             "b_only_correct": mc["b_only_correct"],
             "mcnemar_p": mc["p_value"],
         }
+
+        # The same paired test restricted to the harmful prompts, which is the
+        # test for a difference in *safety rate* specifically.  The full-set
+        # McNemar answers "do these two disagree about anything", which is not
+        # the question when the claim is about a dip in the safety curve:
+        # Gate A needs to know whether that particular dip is real.
+        harmful = a["ground_truth"] == "unsafe"
+        if harmful.any():
+            mc_tpr = mcnemar_exact(
+                (a.loc[harmful, "prediction"] == "unsafe").values,
+                (b.loc[harmful, "prediction"] == "unsafe").values,
+            )
+            row["n_harmful_paired"] = int(harmful.sum())
+            row["mcnemar_tpr_p"] = mc_tpr["p_value"]
+
+        # And the paired test for a difference in FLAG RATE -- how much each
+        # model flags, over all prompts regardless of label.  Flag rate is the
+        # direct observable of where the decision boundary sits, so this is the
+        # test for "the boundary moved between these two precisions".
+        mc_flag = mcnemar_exact(
+            (a["prediction"] == "unsafe").values,
+            (b["prediction"] == "unsafe").values,
+        )
+        row["mcnemar_flag_p"] = mc_flag["p_value"]
         if has_scores(a) and has_scores(b):
             dl = delong_test(to_labels(a["ground_truth"].values), a["p_unsafe"].values, b["p_unsafe"].values)
+            # delong_se is the standard error of the PAIRED difference; Gate C
+            # needs it to test equivalence, not merely non-significance.
             row.update({"auroc_a": dl["auc_a"], "auroc_b": dl["auc_b"],
-                        "auroc_delta": dl["delta"], "delong_p": dl["p_value"]})
+                        "auroc_delta": dl["delta"], "delong_se": dl["se"],
+                        "delong_p": dl["p_value"]})
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    for column, label in [("mcnemar_p", "mcnemar"), ("delong_p", "delong")]:
-        if not df.empty and column in df.columns and df[column].notna().all():
-            corrected = holm_correction(df[column].values)
-            df[f"{label}_p_holm"] = [c["p_holm"] for c in corrected]
-            df[f"{label}_significant"] = [c["significant"] for c in corrected]
+    # Correct over the pairs that were actually tested.  Requiring every row to
+    # be non-null dropped the correction entirely whenever a single model came
+    # from an unscored run, which silently removed `delong_significant` -- the
+    # column Gate C and the algorithm axis both read -- for every other pair.
+    #
+    # The correction spans all pairs, including cross-family ones that no gate
+    # interprets.  That is deliberately conservative: it can only make a
+    # difference harder to declare, and Gate C's confirmation branch rests on
+    # equivalence rather than on non-significance, so it cannot be flattered by
+    # an over-strict correction.
+    for column, label in [("mcnemar_p", "mcnemar"), ("mcnemar_tpr_p", "mcnemar_tpr"),
+                          ("mcnemar_flag_p", "mcnemar_flag"), ("delong_p", "delong")]:
+        if df.empty or column not in df.columns:
+            continue
+        mask = df[column].notna()
+        if not mask.any():
+            continue
+        corrected = holm_correction(df.loc[mask, column].values)
+        df[f"{label}_p_holm"] = np.nan
+        df[f"{label}_significant"] = pd.NA
+        df.loc[mask, f"{label}_p_holm"] = [c["p_holm"] for c in corrected]
+        df.loc[mask, f"{label}_significant"] = [c["significant"] for c in corrected]
+        df[f"{label}_significant"] = df[f"{label}_significant"].astype("boolean")
     return df
 
 
@@ -160,6 +208,20 @@ def recalibration_table(combined, models):
             row = recalibrate(y, sub["p_unsafe"].values, target)
             row["model"] = model
             rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def decomposition_table(combined, models):
+    """Scale/location split of each precision's shift (Platt)."""
+    rows = []
+    for model in models:
+        sub = combined[combined["model"] == model]
+        if not has_scores(sub) or "margin" not in sub.columns:
+            continue
+        row = calibration_decomposition(to_labels(sub["ground_truth"].values),
+                                        sub["margin"].values)
+        row["model"] = model
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -405,6 +467,9 @@ def main():
     recal = recalibration_table(combined, models) if scored else pd.DataFrame()
     save(recal, args.tables_dir, "recalibration")
 
+    decomp = decomposition_table(combined, models) if scored else pd.DataFrame()
+    save(decomp, args.tables_dir, "calibration_decomposition")
+
     deploy = safety_per_gb(combined, memory_col=args.memory_col) if scored else pd.DataFrame()
     if not deploy.empty:
         deploy["efficiency_comparable"] = efficiency_ok
@@ -415,15 +480,27 @@ def main():
     save(iso_memory_comparison(combined, BUDGETS_GB) if scored else pd.DataFrame(),
          args.tables_dir, "iso_memory")
 
-    fast = args.fast_model or (models[-1] if len(models) > 1 else None)
+    # A cascade is "cheap guard escalates the uncertain cases to the expensive
+    # one".  Both have to be the same model, or it measures an architecture
+    # swap rather than a precision one, so the fast model defaults to the
+    # lowest precision *of the reference's family*.
+    same_family = [m for m in models if family_of(m) == family_of(reference)]
+    fast = args.fast_model or (same_family[-1] if len(same_family) > 1 else None)
     cascade = pd.DataFrame()
     if scored and fast and fast != reference:
+        if family_of(fast) != family_of(reference):
+            print(f"  [WARNING] cascade pairs {fast} with {reference}: different "
+                  f"families, so the result includes an architecture change")
         cascade = uncertainty_cascade(combined, fast, reference)
         save(cascade, args.tables_dir, "uncertainty_cascade")
 
-    verdicts = {"gate_a": gate_a(pairs, summary), "gate_c": gate_c(summary),
+    verdicts = {"gate_a": gate_a(pairs, summary), "gate_c": gate_c(summary, pairs),
                 "gate_d": gate_d(recal) if not recal.empty else {"gate": "D", "status": "NOT_EVALUABLE"}}
     verdicts["hardware_consistency"] = hardware
+    verdicts["peak_improvement"] = peak_improvement(summary, pairs)
+    verdicts["calibration_decomposition"] = (
+        calibration_decomposition_report(decomp, summary) if not decomp.empty
+        else {"check": "calibration_decomposition", "status": "NOT_EVALUABLE"})
     crossover = base_rate_crossover(base_df, BASE_RATES)
 
     sweep = pd.read_csv(args.layer_sweep) if os.path.exists(args.layer_sweep) else pd.DataFrame()
@@ -445,6 +522,13 @@ def main():
     algo_keys = [f"{DEFAULT_FAMILY}:{p}" for p in ALGORITHM_AXIS_4BIT]
     evidence = {
         "gate_a": verdicts["gate_a"]["status"],
+        "operating_point_shift": verdicts["gate_a"].get("operating_point_shift"),
+        "peak_improvement": verdicts["peak_improvement"]["status"],
+        "boundary_drift_non_monotonic": (
+            all(v["boundary_drift_non_monotonic"]
+                for v in verdicts["gate_a"].get("per_family", {}).values())
+            if verdicts["gate_a"].get("per_family") else None),
+        "location_shift_explains": verdicts["calibration_decomposition"].get("explains"),
         "gate_c": verdicts["gate_c"]["status"],
         "gate_d": verdicts["gate_d"]["status"],
         "base_rate_crossover": crossover["crossover_observed"],
@@ -483,7 +567,33 @@ def main():
     for key in ("gate_a", "gate_c", "gate_d"):
         v = verdicts[key]
         print(f"  {v['gate']}: {v['status']:<22} {v.get('reason','')}")
+        # A and C are within-family verdicts; the replication across the two
+        # architectures is the point of running a second family, so print it
+        # rather than leaving it in the JSON.
+        for family, fv in (v.get("per_family") or {}).items():
+            print(f"       {family:<22} {fv['status']}")
+        if v.get("per_family") and not v.get("replicated", True):
+            print(f"       -> families DISAGREE; the finding does not replicate")
     print(f"  HW: {hardware['status']:<22} {hardware['reason']}")
+
+    print("\n=== Does moderate quantization improve on FP16? ===")
+    pk = verdicts["peak_improvement"]
+    print(f"  {pk['status']:<28} {pk.get('reason','')}")
+    for family, v in (pk.get("per_family") or {}).items():
+        print(f"       {family:<22} peak {v['peak_model'].split(':')[-1]} "
+              f"{v['peak_safety_rate']:.4f} vs fp16 {v['reference_safety_rate']:.4f} "
+              f"(delta {v['delta']:+.4f}, fpr {v['reference_fpr']:.3f} -> {v['peak_fpr']:.3f})")
+
+    print("\n=== Scale vs location: which moved? ===")
+    cd = verdicts["calibration_decomposition"]
+    print(f"  {cd['status']:<28} {cd.get('reason','')}")
+    for family, v in (cd.get("per_family") or {}).items():
+        r = v["location_safety_correlation"]
+        print(f"       {family:<22} location spread {v['location_shift_spread']:+.4f}, "
+              f"temperature {v['temperature_min']:.2f}-{v['temperature_max']:.2f}, "
+              f"r(location, safety) = "
+              + ("n/a" if r is None else f"{r:.3f}"))
+    print(f"  threshold repair (Gate D): {verdicts['gate_d']['status']}")
 
     print("\n=== Algorithm axis (same bits, different method) ===")
     for axis_name, v in axis_verdicts.items():

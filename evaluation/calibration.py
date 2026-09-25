@@ -164,3 +164,151 @@ def recalibrate(
         "default_f1": default["f1"],
         "default_balanced_accuracy": default["balanced_accuracy"],
     }
+
+
+def fit_platt(margins: Sequence[float], y_true: Sequence[int],
+              max_iter: int = 100, tol: float = 1e-9) -> Dict[str, float]:
+    """
+    Fit p = sigmoid(a*m + b) by Newton/IRLS.  No scipy dependency.
+
+    Two parameters, and they mean different things:
+
+      a  scale     how sharply confidence rises with the margin.  a < 1 means
+                   the model is overconfident, and 1/a is the temperature.
+      b  intercept where the calibrated boundary sits.
+
+    Only the ratio moves decisions.  `sigmoid(a*m + b) >= 0.5` reduces to
+    `m >= -b/a`, so -b/a is the estimated systematic shift of the score
+    distribution against the model's own fixed boundary at m = 0.
+    """
+    m = np.asarray(margins, dtype=np.float64)
+    y = np.asarray(y_true, dtype=np.float64)
+    keep = np.isfinite(m)
+    m, y = m[keep], y[keep]
+    if len(m) == 0 or len(np.unique(y)) < 2:
+        return {"scale": float("nan"), "intercept": float("nan"),
+                "location_shift": float("nan"), "temperature": float("nan"),
+                "nll_before": float("nan"), "nll_after": float("nan"),
+                "converged": False}
+
+    # Fit on standardized margins.  Guard scores are well separated, so the
+    # raw scale spans orders of magnitude, p saturates, and an unstandardized
+    # Newton step wanders into a negative slope -- a calibration map that says
+    # a higher unsafe-margin means less unsafe.  Standardizing conditions the
+    # problem; the parameters are mapped back afterwards.
+    centre, spread = float(np.mean(m)), float(np.std(m))
+    if not np.isfinite(spread) or spread == 0:
+        spread = 1.0
+    z = (m - centre) / spread
+    X = np.column_stack([z, np.ones_like(z)])
+
+    def _nll(weights):
+        q = np.clip(sigmoid(X @ weights), 1e-12, 1 - 1e-12)
+        return float(-np.mean(y * np.log(q) + (1 - y) * np.log(1 - q)))
+
+    w = np.array([1.0, 0.0])
+    converged = False
+    current = _nll(w)
+    for _ in range(max_iter):
+        p = sigmoid(X @ w)
+        sw = np.clip(p * (1 - p), 1e-8, None)
+        grad = X.T @ (y - p)
+        hess = X.T @ (X * sw[:, None]) + 1e-6 * np.eye(2)
+        try:
+            step = np.linalg.solve(hess, grad)
+        except np.linalg.LinAlgError:
+            break
+
+        alpha, improved = 1.0, False
+        for _ in range(40):
+            candidate = w + alpha * step
+            value = _nll(candidate)
+            if value <= current:
+                w, current, improved = candidate, value, True
+                break
+            alpha *= 0.5
+        if not improved:
+            # The line search could not improve: stuck, not converged.  These
+            # are different states and only one of them is a usable fit.
+            break
+        if np.max(np.abs(alpha * step)) < tol:
+            converged = True
+            break
+
+    # Back to the original margin scale: a*m + b == a_z*z + b_z.
+    w = np.array([w[0] / spread, w[1] - w[0] * centre / spread])
+
+    a, b = float(w[0]), float(w[1])
+    # Evaluate with the back-transformed parameters against the ORIGINAL
+    # margins.  `X` holds standardized margins, so `X @ w` after the transform
+    # mixes the two scales and reports a fitted model as worse than the raw one.
+    p_fit = np.clip(sigmoid(a * m + b), 1e-12, 1 - 1e-12)
+    p_raw = np.clip(sigmoid(m), 1e-12, 1 - 1e-12)
+    # A calibration map must be increasing in the margin.  A non-positive
+    # slope is a failed fit, not a finding, and must not reach a table.
+    valid = converged and a > 0
+    if not valid:
+        return {"scale": float("nan"), "intercept": float("nan"),
+                "location_shift": float("nan"), "temperature": float("nan"),
+                "nll_before": float("nan"), "nll_after": float("nan"),
+                "converged": False}
+
+    return {
+        "scale": a,
+        "intercept": b,
+        # Where the model's scores sit relative to its own boundary.  This is
+        # the quantity that changes decisions; the scale does not.
+        "location_shift": float(-b / a) if a != 0 else float("nan"),
+        "temperature": float(1.0 / a) if a != 0 else float("nan"),
+        "nll_before": float(-np.mean(y * np.log(p_raw) + (1 - y) * np.log(1 - p_raw))),
+        "nll_after": float(-np.mean(y * np.log(p_fit) + (1 - y) * np.log(1 - p_fit))),
+        "converged": converged,
+    }
+
+
+def calibration_decomposition(
+    y_true: Sequence[int],
+    margins: Sequence[float],
+    seed: int = 42,
+    calibration_fraction: float = 0.5,
+) -> Dict[str, float]:
+    """
+    Split a precision's shift into a scale part and a location part.
+
+    This replaces a temperature-only repair, which was vacuous: for any
+    temperature T > 0, `sigmoid(m/T) >= 0.5` is exactly `m >= 0`, so rescaling
+    confidence cannot change a single decision at a fixed 0.5 threshold.  A
+    change in safety rate at a fixed threshold is therefore *never* explained
+    by temperature alone -- it must be a movement of the scores relative to
+    the boundary.
+
+    That is the point of the decomposition rather than an obstacle to it: the
+    scale part is what inflates ECE, the location part is what moves the
+    safety rate, and separating them says which mechanism is doing the work.
+    """
+    y = np.asarray(y_true, dtype=int)
+    m = np.asarray(margins, dtype=np.float64)
+    cal, test = split_calibration_test(y, seed=seed, calibration_fraction=calibration_fraction)
+
+    fit = fit_platt(m[cal], y[cal])
+    raw = rates_at(y[test], sigmoid(m[test]), 0.5)
+    scaled = sigmoid(fit["scale"] * m[test] + fit["intercept"])
+    repaired = rates_at(y[test], scaled, 0.5)
+
+    return {
+        "scale": fit["scale"],
+        "intercept": fit["intercept"],
+        "location_shift": fit["location_shift"],
+        "temperature": fit["temperature"],
+        "converged": fit["converged"],
+        "n_calibration": int(len(cal)),
+        "n_test": int(len(test)),
+        "default_tpr": raw["tpr"],
+        "default_fpr": raw["fpr"],
+        "default_flag_rate": raw["flag_rate"],
+        "repaired_tpr": repaired["tpr"],
+        "repaired_fpr": repaired["fpr"],
+        "repaired_flag_rate": repaired["flag_rate"],
+        "ece_before": expected_calibration_error(y[test], sigmoid(m[test]))["ece"],
+        "ece_after": expected_calibration_error(y[test], scaled)["ece"],
+    }

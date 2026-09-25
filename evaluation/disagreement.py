@@ -121,11 +121,40 @@ def borderline_subset(
     return out
 
 
+def _family_of(model: str) -> str:
+    return str(model).split(":", 1)[0] if ":" in str(model) else str(model)
+
+
+def family_references(models: List[str], reference: Optional[str] = None) -> Dict[str, str]:
+    """
+    One reference per architecture: each family's own highest precision.
+
+    A flip is "this prompt changed verdict when I quantized the model".  That
+    only means anything against the same model at full precision.  Scoring
+    qwen3guard:q2_k against llama-guard:fp16 measures how far apart two
+    different guards are, and because the two families' boundaries sit at
+    different places, the artefact has a direction: as Qwen's ladder drifts
+    toward Llama's boundary its apparent flip rate *falls* with precision,
+    reversing the very trend the flip analysis exists to show.
+
+    `models` is expected in the order `registry.sort_keys` produces, so the
+    first entry of each family is its highest precision.  An explicit
+    `reference` overrides the choice for its own family only.
+    """
+    refs: Dict[str, str] = {}
+    for model in models:
+        refs.setdefault(_family_of(model), model)
+    if reference:
+        refs[_family_of(reference)] = reference
+    return refs
+
+
 def flip_report(combined: pd.DataFrame, models: List[str], reference: Optional[str] = None):
-    ref = reference or models[0]
+    refs = family_references(models, reference)
     summaries, all_flips, distance_tables = [], [], []
     for target in models:
-        if target == ref:
+        ref = refs.get(_family_of(target))
+        if ref is None or target == ref:
             continue
         flips = flip_table(combined, ref, target)
         if flips.empty:

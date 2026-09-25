@@ -30,12 +30,35 @@ def bootstrap_ci(
     return lo, hi, values
 
 
-def binomial_two_sided(n: int, k: int) -> float:
+# Above this many discordant pairs the exact test is both unnecessary and
+# expensive: the normal approximation agrees to several decimal places, while
+# the exact sum costs ~15 s per test at n=20000 -- minutes across a full
+# pairwise table.  Phase 4 scales to Tier A, so this path is reached in
+# normal use, not only in principle.
+EXACT_BINOMIAL_MAX_N = 1000
+
+
+def binomial_two_sided(n: int, k: int, exact_max: int = EXACT_BINOMIAL_MAX_N) -> float:
+    """
+    Two-sided binomial test against p = 0.5.
+
+    The division is done on Python integers.  `2.0 ** n` would coerce to float
+    first and raise OverflowError for n > 1023, which is a plausible number of
+    discordant pairs the moment the prompt set grows past a few thousand rows;
+    integer true division is correctly rounded and has no such ceiling.
+    """
     if n == 0:
         return 1.0
     k = min(k, n - k)
-    tail = sum(math.comb(n, i) for i in range(k + 1))
-    return min(1.0, 2.0 * tail / (2.0**n))
+
+    if n <= exact_max:
+        tail = sum(math.comb(n, i) for i in range(k + 1))
+        numerator, denominator = 2 * tail, 1 << n
+        return 1.0 if numerator >= denominator else numerator / denominator
+
+    # Normal approximation with a continuity correction.
+    z = (abs(k - n / 2.0) - 0.5) / math.sqrt(n / 4.0)
+    return min(1.0, 2.0 * _normal_sf(max(z, 0.0)))
 
 
 def mcnemar_exact(correct_a: Sequence[bool], correct_b: Sequence[bool]) -> Dict[str, float]:
@@ -52,6 +75,7 @@ def mcnemar_exact(correct_a: Sequence[bool], correct_b: Sequence[bool]) -> Dict[
         "b_only_correct": n01,
         "discordant": n,
         "p_value": p,
+        "p_method": "exact" if n <= EXACT_BINOMIAL_MAX_N else "normal_approximation",
         "odds_ratio": (n10 + 0.5) / (n01 + 0.5),
     }
 
@@ -116,13 +140,21 @@ def delong_test(
     if var <= 0:
         p = 1.0 if diff == 0 else 0.0
         z = 0.0
+        se = 0.0
     else:
-        z = diff / math.sqrt(var)
+        se = math.sqrt(var)
+        z = diff / se
         p = 2 * _normal_sf(abs(z))
+    # `se` is the standard error of the PAIRED difference, not of either AUC.
+    # It is what an equivalence test needs: a confidence interval on the gap
+    # itself.  Marginal CIs on two AUCs, which ignore that both models scored
+    # the same prompts, are far wider and overlap almost regardless of the
+    # truth -- so "the CIs overlap" is not evidence that the gap is small.
     return {
         "auc_a": float(aucs[0]),
         "auc_b": float(aucs[1]),
         "delta": diff,
+        "se": float(se),
         "z": float(z),
         "p_value": float(p),
     }

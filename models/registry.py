@@ -74,7 +74,18 @@ PRECISION_ORDER = [
 # lower precision does to a guard's operating point.
 ACTIVE_GROUP = "all-families-ladder"
 
-BIT_LADDER = ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m", "q2_k"]
+# Q3 to FP16, matching the research plan's stated scope.  Q2_K is deliberately
+# out of scope: the question is what *moderate* quantization does to a guard's
+# operating point, and 2-bit is where k-quants start losing the model itself.
+# Including it risks a genuine capability break at the bottom rung deciding a
+# gate about the middle of the ladder.  It stays in the registry as a labelled
+# control -- run it explicitly with `--models llama-guard-3-8b:q2_k` if you
+# want the "where does it finally break" figure -- but nothing in the default
+# path downloads or scores it.
+BIT_LADDER = ["fp16", "q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m"]
+
+# Out of scope for this paper, available on request.
+OUT_OF_SCOPE_PRECISIONS = ["q2_k"]
 
 # Reserved for the follow-up paper on the algorithm axis ("at a fixed bit
 # budget, does the compression method change the decision?").  These stay in

@@ -88,6 +88,8 @@ def run_sweep(
         stats = summarize(scored)
 
         weights = [m.weight.data for _, m in layer.named_modules() if hasattr(m, "weight") and m.weight.dim() == 2]
+        # Only the first 2-D weight in the layer, so these columns describe one
+        # projection, not the layer.  Named accordingly.
         err = quantization_error(weights[0], bits, group_size) if weights else {}
 
         row = {
@@ -103,9 +105,18 @@ def run_sweep(
             "margin_shift": stats["margin_mean"] - baseline["margin_mean"],
             "margin_std": stats["margin_std"],
             "margin_std_ratio": stats["margin_std"] / max(baseline["margin_std"], 1e-9),
-            **{f"weight_{k}": v for k, v in err.items()},
+            **{f"first_proj_{k}": v for k, v in err.items()},
         }
-        row["sensitivity"] = abs(row["margin_shift"]) + 10 * abs(row["auroc_delta"])
+        # Two rankings, not one score.  `margin_shift` is operating point drift
+        # and `auroc_delta` is discrimination loss -- the two effects this
+        # paper exists to tell apart -- so adding them answers neither
+        # question.  The old composite also carried an undocumented 10x on a
+        # quantity an order of magnitude smaller, which made it a drift
+        # ranking wearing a disguise.  `sensitivity` stays as an alias for the
+        # drift ranking, which is what the drift claim needs.
+        row["drift_sensitivity"] = abs(row["margin_shift"])
+        row["discrimination_sensitivity"] = abs(row["auroc_delta"])
+        row["sensitivity"] = row["drift_sensitivity"]
         rows.append(row)
         print(f"  layer {i:>2}: margin_shift={row['margin_shift']:+.4f} "
               f"auroc_delta={row['auroc_delta']:+.4f} sensitivity={row['sensitivity']:.4f}")
@@ -113,8 +124,12 @@ def run_sweep(
         model.invalidate_prefix_cache()
         model.build_prefix_cache()
 
-    sweep = pd.DataFrame(rows).sort_values("sensitivity", ascending=False).reset_index(drop=True)
+    sweep = pd.DataFrame(rows).sort_values("drift_sensitivity", ascending=False).reset_index(drop=True)
     sweep["rank"] = np.arange(1, len(sweep) + 1)
+    # A separate rank for the other effect, so the two can be compared rather
+    # than conflated.  If they disagree, that disagreement is itself a result.
+    sweep["discrimination_rank"] = (
+        sweep["discrimination_sensitivity"].rank(ascending=False, method="min").astype(int))
     sweep.to_csv(os.path.join(output_dir, "layer_sensitivity.csv"), index=False)
 
     asym = output_projection_asymmetry(
@@ -128,7 +143,8 @@ def run_sweep(
         print(f"  {k}: {v:+.6f}")
 
     print("\n=== Top sensitive layers ===")
-    print(sweep.head(8)[["rank", "layer", "margin_shift", "auroc_delta", "sensitivity"]].to_string(index=False))
+    print(sweep.head(8)[["rank", "layer", "margin_shift", "auroc_delta",
+                         "drift_sensitivity", "discrimination_rank"]].to_string(index=False))
     print(f"\nWrote {output_dir}/layer_sensitivity.csv")
     return sweep
 

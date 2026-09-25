@@ -159,7 +159,7 @@ which takes precedence, so without this variable ~145 GB lands on the pod's
 ephemeral container disk and is lost when the pod stops.
 
 Group sizes: `bit-ladder` 49 GB, `algorithm-4bit` 24 GB, `algorithm-3bit` 15 GB,
-`all-families-ladder` 99 GB, everything 151 GB. Prefetch the groups for the
+`all-families-ladder` 92.5 GB, everything 151 GB. Prefetch the groups for the
 phases you are about to run rather than the whole set; use `--evict` on
 `run_phase.py` if the volume cannot hold a group.
 
@@ -186,7 +186,7 @@ Read `results/tables/gates.json` before doing anything else.
 |---|---|---|
 | 0 Validity | `python scripts/run_phase.py --phase 0 --n-gpu-layers 0` | A: pattern survives the official template |
 | 1 Scores | `python scripts/verify_scorer.py --model q4 --dataset xstest` | B: >99% agreement, >5x cache speedup |
-| 2 Threshold-free | `python evaluation/analyze.py` | C: AUROC gap < 0.02 with overlapping CIs |
+| 2 Threshold-free | `python evaluation/analyze.py` | C: paired AUROC gap equivalent within 0.02 (TOST) |
 | 3 Calibration | included in `analyze.py` | D: recalibration collapses the gap |
 | 4 Scale | `python scripts/run_phase.py --phase 4 --evict` | replication across models and traffic |
 | 5 Algorithms | *deferred to a follow-up paper* | do same-bit algorithms diverge? |
@@ -211,14 +211,21 @@ llama-guard-3-8b    fp16 bf16 q8_0 q6_k q5_k_m q5_k_s q4_k_m q4_0 iq4_xs
                     q3_k_l q3_k_m q3_k_s iq3_xs q2_k
 qwen3guard-gen-8b   fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m q2_k
 
-**Scope of this paper: 14 models — the two bit ladders.**
+**Scope of this paper: 12 models — the two bit ladders, Q3 to FP16.**
 
 ```
-llama-guard-3-8b    fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m q2_k
-qwen3guard-gen-8b   fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m q2_k
+llama-guard-3-8b    fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m
+qwen3guard-gen-8b   fp16 q8_0 q6_k q5_k_m q4_k_m q3_k_m
 ```
 
-That is `all-families-ladder` (99 GB), the default for `preflight.py`,
+`q2_k` is out of scope and not in `BIT_LADDER`. The question is what *moderate*
+quantization does to a guard's operating point, and 2-bit is where k-quants
+start losing the model itself — a genuine capability break at the bottom rung
+should not decide a gate about the middle of the ladder. It stays in the
+registry as a labelled control: run it explicitly with
+`--models llama-guard-3-8b:q2_k` for a "where does it finally break" figure.
+
+That is `all-families-ladder` (92.5 GB), the default for `preflight.py`,
 `prefetch_models.py` and `verify_models.py`. It answers one question: what does
 lower precision do to a guard's operating point, and does the pattern replicate
 across two architectures.
@@ -303,6 +310,7 @@ scripts/
   run_model.py           score one model on one dataset
   run_phase.py           orchestrate a phase, with disk checks and eviction
   verify_scorer.py       Gate B
+  verify_gates.py        gates vs synthetic data of known truth
   label_audit.py         Gate A label-noise audit
   preflight.py           environment, models, datasets, templates: all checks
   prefetch_models.py     download weights ahead of a run
@@ -347,14 +355,70 @@ margin_distributions, reliability, flip_rate_vs_distance, memory_pareto, uncerta
 
 ## Gates
 
-Criteria are fixed in `evaluation/gates.py` before any data is seen.
+Criteria are fixed in `evaluation/gates.py` before any data is seen. That
+commitment only means something if the criteria can be failed, so
+`scripts/verify_gates.py` runs every gate against synthetic prediction sets
+whose truth is known by construction — a pure operating-point slide, a real
+capability loss, an underpowered sample, and two families of unequal intrinsic
+skill — and asserts each verdict. Run it before the sweep and after any edit to
+`gates.py`:
+
+```bash
+python scripts/verify_gates.py
+```
+
 
 This paper makes one claim: quantization shifts a guard's operating point. The second
 claim — that the algorithm matters at fixed bit width — is deferred, and its gate is
 implemented but reads `NOT_TESTED`.
 
-**A — validity.** Non-monotonic differences still significant after Holm correction, and not
-monotonic in bit width. If it fails, the finding becomes "prompt formatting explains reported
+Every within-ladder analysis is computed **within a family** and then compared
+across families: the four gates, the flip tables (each family flips against its
+own FP16), the base-rate crossover, and the uncertainty cascade.
+The ladder is a within-architecture question: a table holding both families
+sorted by bit width interleaves `llama-guard-3-8b:q8_0` with
+`qwen3guard-gen-8b:q8_0`, so any trend or spread taken over the pooled table
+measures the gap between two different models rather than the effect of
+precision. Each gate reports `per_family` verdicts plus `replicated`, which is
+what the second family exists to answer.
+
+The same rule applies outside the gates. A flip is "this prompt changed verdict
+when I quantized *this* model", so scoring `qwen3guard-gen-8b:q2_k` against
+`llama-guard-3-8b:fp16` measures the distance between two different guards —
+and because the two boundaries sit in different places, that artefact has a
+direction: as one family's ladder drifts toward the other's boundary its
+apparent flip rate *falls* with precision, reversing the trend the flip
+analysis exists to show. A base-rate "crossover" pooled across families is
+usually just the stronger architecture winning, and a cascade pairing one
+family's Q2 with the other's FP16 is an architecture swap, not a precision one.
+
+**A — validity.** This is the gate for the headline claim: that safety is not
+monotonic in precision.
+
+`PATTERN_SURVIVES` requires a *significant reversal*. A reversal is a pair of
+rungs where the safety curve moves against its own overall trend; it counts
+only if the paired McNemar test for that specific pair, restricted to the
+harmful prompts, survives Holm correction. Seven rungs measured on a few
+hundred prompts will nearly always contain a small dip by chance — 12 of 12
+synthetic runs in `verify_gates.py` case 6 produce two or three — so reading
+"not strictly monotonic" as "non-monotonic" would license the paper's central
+claim on sampling error. `strictly_monotonic_in_sample` is reported separately
+from `non_monotonic_confirmed`, and only the second licenses anything.
+
+One practical warning: the test is run on the safety rate, which saturates.
+If a guard detects ~99% of harmful prompts at every precision, no reversal can
+reach significance regardless of what the model is doing — a real bump gets
+compressed into a one-prompt difference. Check `summary_metrics.csv` for
+saturation before concluding the pattern is absent; a ceiling is a property of
+the prompt set, not a result.
+
+If no reversal survives, the ladder is monotonic → If the ladder *is* monotonic but the
+true positive rate and the false positive rate rise together (correlation ≥ 0.5
+across the ladder), the verdict is `THRESHOLD_SHIFT`, not a refutation: a guard
+flagging more of everything has moved its operating point, which is this
+paper's claim rather than a failure of it. `MONOTONIC` — safety moving with
+precision while the false positive rate does not follow — is the status that
+retires the anomaly and makes the finding "prompt formatting explains reported
 quantization-safety effects."
 
 **B — scorer.** `p_unsafe >= 0.5` reproduces argmax labels on >99% of rows. Only the
@@ -364,11 +428,29 @@ launch-overhead bound, so a correct cache saves far less wall clock. `verify_sco
 also checks that the cache does not change any score, which matters on CUDA where
 `save_state`/`load_state` round-trips the KV cache through host memory.
 
-**C — discrimination.** `H3_CONFIRMED` if max pairwise AUROC gap < 0.02 with overlapping
-bootstrap CIs. `H3_REJECTED` if gap > 0.02 with DeLong separation. `UNDERPOWERED` otherwise —
-the only condition authorising early data scaling.
+**C — discrimination.** The hinge of the paper, so the test is built to be
+failable. Every precision scores the same prompts, so each pair is compared
+with a **paired** DeLong test, and the gap is judged by **equivalence**, not by
+non-significance:
 
-**D — repair.** Recalibration at matched FPR collapses cross-precision TPR spread below 0.02.
+- `H3_REJECTED` — some pair differs by ≥ 0.02 AUROC *and* its DeLong test
+  survives Holm correction. Significance alone is not enough; on a large enough
+  sample a 0.001 gap is significant and irrelevant.
+- `H3_CONFIRMED` — every pair passes TOST: the 90% CI on the paired difference
+  lies entirely inside ±0.02.
+- `UNDERPOWERED` — neither. The only condition authorising early data scaling.
+
+Confirming H3 is a claim that the gap is *small*, and "we failed to find a
+difference" does not support it — a weak test fails to find anything. The
+earlier criterion (do two marginal bootstrap CIs overlap?) had both failure
+modes: on a few hundred prompts those CIs are wide enough to overlap almost
+regardless of the truth, so confirmation was near-automatic and rejection near
+unreachable. Under the equivalence rule weak data lands on `UNDERPOWERED`,
+which is the honest verdict, and the hypothesis can no longer be confirmed by
+the weakness of its own test.
+
+**D — repair.** Recalibration at matched FPR collapses within-family
+cross-precision TPR spread below 0.02.
 
 `claims_to_evidence.csv` marks every claim `LICENSED`, `NOT_LICENSED` or `NOT_TESTED`.
 Never write a claim the table has not licensed.
