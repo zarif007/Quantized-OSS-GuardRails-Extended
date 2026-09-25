@@ -1,3 +1,7 @@
 models/weights
 # smoke-test scratch output
 results/smoke/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
