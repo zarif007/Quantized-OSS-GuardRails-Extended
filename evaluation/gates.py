@@ -31,6 +31,22 @@ GATE_A_COMOVEMENT_R = 0.5
 # On a GPU the whole forward pass is short and launch-overhead bound, so the
 # same correct implementation yields far less.  A single 5x target would fail
 # a valid CUDA run for a reason unrelated to scorer correctness.
+# Gate C rejects H3 when discrimination genuinely differs across the ladder.
+# The direction of that difference decides which paper it is, and the two
+# directions are opposite findings: a guard that ranks worse at 3 bits is a
+# capability loss, a guard that ranks *better* at 3 bits is the strong form of
+# the plan's premise and the one outcome under which a safety gain is not
+# reproducible by moving full precision's own threshold.  An unsigned test
+# reports both as "rejected", so the stronger result would be filed as its
+# opposite.  `H3_REJECTED` without a suffix survives only when bit widths are
+# unavailable and the direction cannot be established.
+GATE_C_REJECTIONS = frozenset({
+    "H3_REJECTED",
+    "H3_REJECTED_DEGRADATION",
+    "H3_REJECTED_IMPROVEMENT",
+    "H3_REJECTED_MIXED",
+})
+
 CACHE_SPEEDUP_TARGET_BY_BACKEND = {"cpu": 5.0, "metal": 3.0, "cuda": 1.2}
 CACHE_SPEEDUP_TARGET = CACHE_SPEEDUP_TARGET_BY_BACKEND["cpu"]  # legacy default
 
@@ -73,6 +89,14 @@ def _family_slice(summary: pd.DataFrame, pairwise: pd.DataFrame, family: str):
             & pairwise["model_b"].map(family_of).eq(family)
         ].copy()
     return sub, pairs
+
+
+def _bits_lookup(sub: pd.DataFrame) -> Dict[str, float]:
+    """model -> bit width, for orienting a comparison along the ladder."""
+    if not {"model", "bits"}.issubset(sub.columns):
+        return {}
+    return {str(m): float(b) for m, b in zip(sub["model"], sub["bits"])
+            if not pd.isna(b)}
 
 
 def _ladder(summary: pd.DataFrame) -> pd.DataFrame:
@@ -438,6 +462,22 @@ def _gate_c_family(sub: pd.DataFrame, pairs: pd.DataFrame,
                else ("delong_p" if "delong_p" in tested.columns else None))
     tested["abs_delta"] = tested["auroc_delta"].abs()
 
+    # `auroc_delta` is auc_a - auc_b, and (a, b) come from combinations over a
+    # sorted model list, so its sign says nothing about the ladder.  Orienting
+    # it against bit width is what makes a rejection interpretable: the same
+    # 0.03 gap is "quantization broke the guard" or "quantization improved it"
+    # depending on which end of the ladder it points to.
+    bits = _bits_lookup(sub)
+
+    def _oriented(row) -> float:
+        """AUROC(lower precision) - AUROC(higher precision) for one pair."""
+        ba, bb = bits.get(str(row["model_a"])), bits.get(str(row["model_b"]))
+        if ba is None or bb is None or ba == bb:
+            return float("nan")
+        return float(row["auroc_delta"]) if ba < bb else -float(row["auroc_delta"])
+
+    tested["delta_lower_minus_higher"] = tested.apply(_oriented, axis=1)
+
     # Rejection: a paired test that survives correction AND a gap large enough
     # to matter.  Significance alone is not enough -- on a large enough sample
     # a 0.001 AUROC difference is significant and irrelevant.
@@ -460,11 +500,41 @@ def _gate_c_family(sub: pd.DataFrame, pairs: pd.DataFrame,
     else:
         n_equivalent, all_equivalent, widest = 0, False, float("nan")
 
+    direction = "NONE"
+    n_improved = n_degraded = 0
+    best_improvement = worst_degradation = float("nan")
+
     if len(material) > 0:
-        status = "H3_REJECTED"
-        reason = (f"{len(material)} of {len(tested)} precision pairs differ by "
-                  f">= {tolerance} AUROC with a paired DeLong test surviving "
-                  f"correction; discrimination genuinely differs")
+        oriented = material["delta_lower_minus_higher"].dropna()
+        n_improved = int((oriented >= tolerance).sum())
+        n_degraded = int((oriented <= -tolerance).sum())
+        if len(oriented):
+            best_improvement = float(oriented.max())
+            worst_degradation = float(oriented.min())
+        head = (f"{len(material)} of {len(tested)} precision pairs differ by "
+                f">= {tolerance} AUROC with a paired DeLong test surviving "
+                f"correction")
+        if oriented.empty:
+            # No bit widths on the summary, so the pairs cannot be ordered
+            # along the ladder.  Report the difference without a direction
+            # rather than guessing one.
+            status, direction = "H3_REJECTED", "UNKNOWN"
+            reason = f"{head}; discrimination genuinely differs (direction not established)"
+        elif n_improved and n_degraded:
+            status, direction = "H3_REJECTED_MIXED", "MIXED"
+            reason = (f"{head}; {n_improved} favour lower precision and "
+                      f"{n_degraded} favour higher precision, so the ladder "
+                      f"does not move in one direction")
+        elif n_improved:
+            status, direction = "H3_REJECTED_IMPROVEMENT", "IMPROVEMENT"
+            reason = (f"{head}, and every one favours the LOWER precision "
+                      f"(best {best_improvement:+.4f} AUROC); quantization "
+                      f"improves discrimination, not merely the operating point")
+        else:
+            status, direction = "H3_REJECTED_DEGRADATION", "DEGRADATION"
+            reason = (f"{head}, and every one favours the HIGHER precision "
+                      f"(worst {worst_degradation:+.4f} AUROC); discrimination "
+                      f"genuinely degrades as bits fall")
     elif all_equivalent:
         status = "H3_CONFIRMED"
         reason = ("every precision pair is statistically equivalent within "
@@ -487,6 +557,11 @@ def _gate_c_family(sub: pd.DataFrame, pairs: pd.DataFrame,
         "auroc_spread": spread,
         "n_pairs": int(len(tested)),
         "n_material_differences": int(len(material)),
+        "direction": direction,
+        "n_material_improvements": n_improved,
+        "n_material_degradations": n_degraded,
+        "best_improvement": best_improvement,
+        "worst_degradation": worst_degradation,
         "n_equivalent_pairs": n_equivalent,
         "widest_equivalence_bound": widest,
         "max_abs_delta": float(tested["abs_delta"].max()),
@@ -519,6 +594,16 @@ def gate_c(summary: pd.DataFrame, pairwise: Optional[pd.DataFrame] = None) -> Di
     *Per family.*  See `_family_slice`.  Two architectures differ in AUROC for
     reasons that have nothing to do with precision, so a spread taken over the
     mixed table would reject H3 on an architecture gap.
+
+    *Signed.*  A rejection is reported as `H3_REJECTED_DEGRADATION` or
+    `H3_REJECTED_IMPROVEMENT` according to which end of the ladder the gap
+    favours.  Both reject the claim that discrimination is unchanged, but they
+    are opposite findings and license opposite papers, and the earlier
+    unsigned test collapsed them: it compared `abs(auroc_delta)` against the
+    tolerance, so a guard that ranked *better* at 3 bits -- the strong form of
+    this project's premise -- would have been recorded as capability
+    degradation.  `H3_REJECTED` unsuffixed survives only for the case where
+    bit widths are missing and the direction cannot be established.
     """
     if "auroc" not in summary.columns or summary["auroc"].isna().all():
         return {"gate": "C", "status": "NOT_EVALUABLE",
@@ -540,12 +625,23 @@ def gate_c(summary: pd.DataFrame, pairwise: Optional[pd.DataFrame] = None) -> Di
 
     statuses = {f: v["status"] for f, v in per_family.items()}
     values = set(statuses.values())
-    if "H3_REJECTED" in values:
-        status = "H3_REJECTED"
+    # A rejection in either family rejects H3, but the direction only carries
+    # over if the families agree on it; one family improving while the other
+    # degrades is a mixed result, not a replication of either.
+    rejected = {v for v in values if v in GATE_C_REJECTIONS}
+    if rejected:
+        status = rejected.pop() if len(rejected) == 1 else "H3_REJECTED_MIXED"
     elif values == {"H3_CONFIRMED"}:
         status = "H3_CONFIRMED"
     else:
         status = "UNDERPOWERED"
+
+    reason = next((v["reason"] for v in per_family.values() if v["status"] == status), None)
+    if reason is None:
+        reason = ("families disagree on the direction of the discrimination change: "
+                  + "; ".join(f"{f}: {st}" for f, st in sorted(statuses.items())))
+
+    directions = {v.get("direction") for v in per_family.values()} - {"NONE", None}
 
     within = [v["auroc_spread"] for v in per_family.values()
               if not np.isnan(v["auroc_spread"])]
@@ -553,7 +649,10 @@ def gate_c(summary: pd.DataFrame, pairwise: Optional[pd.DataFrame] = None) -> Di
     return {
         "gate": "C",
         "status": status,
-        "reason": next(v["reason"] for v in per_family.values() if v["status"] == status),
+        "reason": reason,
+        "rejected": status in GATE_C_REJECTIONS,
+        "direction": (directions.pop() if len(directions) == 1
+                      else ("MIXED" if directions else "NONE")),
         "per_family": per_family,
         "family_statuses": statuses,
         "replicated": len(values) == 1,
@@ -649,6 +748,12 @@ CLAIMS = [
     ("The decision boundary itself moves non-monotonically", "boundary_drift_non_monotonic",
      [True]),
     ("Apparent gains are operating-point drift, not discrimination", "gate_c", ["H3_CONFIRMED"]),
+    # The strong form of the premise, and the only outcome under which a safety
+    # gain is not reproducible by moving full precision's own threshold: lower
+    # precision ranks harmful above harmless *better*, not merely louder.  Gate
+    # D cannot repair this one away, which is what makes it the stronger claim.
+    ("Quantization improves discrimination, not only the operating point",
+     "gate_c", ["H3_REJECTED_IMPROVEMENT"]),
     ("The boundary location shift explains the safety curve",
      "location_shift_explains", [True]),
     ("Fixed-threshold evaluation can misrank precisions", "base_rate_crossover", [True]),

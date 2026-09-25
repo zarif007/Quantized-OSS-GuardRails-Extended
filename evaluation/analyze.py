@@ -566,7 +566,7 @@ def main():
     print("\n=== GATES ===")
     for key in ("gate_a", "gate_c", "gate_d"):
         v = verdicts[key]
-        print(f"  {v['gate']}: {v['status']:<22} {v.get('reason','')}")
+        print(f"  {v['gate']}: {v['status']:<26} {v.get('reason','')}")
         # A and C are within-family verdicts; the replication across the two
         # architectures is the point of running a second family, so print it
         # rather than leaving it in the JSON.

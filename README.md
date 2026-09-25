@@ -433,9 +433,17 @@ failable. Every precision scores the same prompts, so each pair is compared
 with a **paired** DeLong test, and the gap is judged by **equivalence**, not by
 non-significance:
 
-- `H3_REJECTED` — some pair differs by ≥ 0.02 AUROC *and* its DeLong test
-  survives Holm correction. Significance alone is not enough; on a large enough
-  sample a 0.001 gap is significant and irrelevant.
+- `H3_REJECTED_DEGRADATION` / `H3_REJECTED_IMPROVEMENT` — some pair differs by
+  ≥ 0.02 AUROC *and* its DeLong test survives Holm correction. Significance
+  alone is not enough; on a large enough sample a 0.001 gap is significant and
+  irrelevant. The suffix says which end of the ladder the gap favours, after
+  orienting each pair by bit width: `auroc_delta` is `auc_a - auc_b` over an
+  arbitrary pair ordering, so its raw sign carries no information. Both
+  suffixes reject H3, but they are opposite findings — degradation is the
+  ordinary result, improvement is the strong form of this project's premise
+  and the one outcome Gate D cannot repair away. `H3_REJECTED_MIXED` means
+  pairs point both ways or the families disagree; bare `H3_REJECTED` means bit
+  widths were unavailable and the direction could not be established.
 - `H3_CONFIRMED` — every pair passes TOST: the 90% CI on the paired difference
   lies entirely inside ±0.02.
 - `UNDERPOWERED` — neither. The only condition authorising early data scaling.
@@ -448,6 +456,20 @@ regardless of the truth, so confirmation was near-automatic and rejection near
 unreachable. Under the equivalence rule weak data lands on `UNDERPOWERED`,
 which is the honest verdict, and the hypothesis can no longer be confirmed by
 the weakness of its own test.
+
+**P — peak improvement.** Does any quantized rung actually beat its own
+family's FP16 on safety rate, with the paired McNemar test on the harmful
+prompts surviving correction? This is the premise the research plan opens with
+and nothing else tests it: Gate A asks whether the curve *reverses*, which is a
+different question — a curve can reverse without any rung beating FP16, and a
+rung can beat FP16 on a perfectly monotone curve.
+
+`IMPROVEMENT_CONFIRMED` does not on its own license "quantization makes guards
+safer". Read it with C and D: with `H3_CONFIRMED` + `REPAIRED` the gain is real
+but free, reproducible by moving FP16's own threshold, so it is a property of
+the operating point rather than of quantization; only
+`H3_REJECTED_IMPROVEMENT` licenses the unqualified claim. The three readings
+are fixed in `docs/preregistration.md`.
 
 **D — repair.** Recalibration at matched FPR collapses within-family
 cross-precision TPR spread below 0.02.

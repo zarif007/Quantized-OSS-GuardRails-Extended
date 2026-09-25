@@ -18,14 +18,25 @@ The cases, and why each one exists:
                                  construction.  A -> THRESHOLD_SHIFT,
                                  C -> H3_CONFIRMED, D -> REPAIRED.
   2  real capability loss        rank-scrambling noise at low precision.
-                                 C must REJECT; a gate that cannot reject here
-                                 is decoration.
+                                 C must reject, and say DEGRADATION; a gate
+                                 that cannot reject here is decoration.
+  2b real capability GAIN        the mirror: scrambling at high precision, so
+                                 the low rungs rank better.  C must reject and
+                                 say IMPROVEMENT.  Together with 2 this is the
+                                 sign check -- an unsigned gate passes 2 and
+                                 fails 2b by filing the project's strongest
+                                 possible result as its opposite.
   3a small n, small difference   a real gap far under tolerance, on 120 rows.
                                  Not resolvable -> UNDERPOWERED.
   3b same difference, n=4000     now resolvable, and resolvably small ->
                                  H3_CONFIRMED.  3a and 3b together are the
                                  power check: the verdict must depend on the
                                  evidence, not only on the effect.
+  5  a genuine bump at one rung  the non-monotonic pattern the paper is named
+                                 after: A must license it, and the peak-vs-FP16
+                                 test must confirm the improvement.
+  6  a wobble with no real       sampling noise only.  A must NOT license it.
+     reversal
   4  two families, different     each family internally a pure threshold shift,
      intrinsic skill             but ~0.1 AUROC apart from each other.  This is
                                  the shape of the real experiment.  Gates
@@ -44,7 +55,7 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from evaluation.analyze import build_summary, pairwise_tests, recalibration_table
-from evaluation.gates import gate_a, gate_c, gate_d
+from evaluation.gates import gate_a, gate_c, gate_d, peak_improvement
 from models.registry import BIT_LADDER
 
 N_DEFAULT = 650          # the core prompt set: 450 XSTest + 200 HarmBench
@@ -98,17 +109,20 @@ def verdicts(combined):
     summary = build_summary(combined, models)
     pairs = pairwise_tests(combined, models)
     recal = recalibration_table(combined, models)
-    return (gate_a(pairs, summary), gate_c(summary, pairs), gate_d(recal), summary)
+    return (gate_a(pairs, summary), gate_c(summary, pairs), gate_d(recal),
+            peak_improvement(summary, pairs), summary)
 
 
-def check(name, combined, expect_a=None, expect_c=None, expect_d=None, expect_shift=None):
-    a, c, d, summary = verdicts(combined)
+def check(name, combined, expect_a=None, expect_c=None, expect_d=None, expect_shift=None,
+          expect_peak=None):
+    a, c, d, peak, summary = verdicts(combined)
     failures = []
     if expect_shift is not None and a.get("operating_point_shift") != expect_shift:
         failures.append(f"{name} operating_point_shift: expected {expect_shift}, "
                         f"got {a.get('operating_point_shift')}")
     print(f"\n{name}")
-    for gate, got, expected in (("A", a, expect_a), ("C", c, expect_c), ("D", d, expect_d)):
+    for gate, got, expected in (("A", a, expect_a), ("C", c, expect_c), ("D", d, expect_d),
+                                ("P", peak, expect_peak)):
         if expected is None:
             mark = "   "
         elif got["status"] == expected:
@@ -118,6 +132,8 @@ def check(name, combined, expect_a=None, expect_c=None, expect_d=None, expect_sh
             failures.append(f"{name} gate {gate}: expected {expected}, got {got['status']}")
         detail = got.get("family_statuses") or ""
         print(f"  {gate} {mark} {got['status']:<28} {detail}")
+        if gate == "C" and got.get("direction") not in (None, "NONE"):
+            print(f"        direction: {got['direction']}")
     return failures, summary
 
 
@@ -144,7 +160,19 @@ def main():
 
     f, _ = check("2. genuine degradation         (truth: discrimination breaks)",
                  synth(primary, n=args.n, noise={"q4_k_m": 1.6, "q3_k_m": 3.0}, seed=2),
-                 expect_c="H3_REJECTED")
+                 expect_c="H3_REJECTED_DEGRADATION")
+    failures += f
+
+    # 2b. The mirror of case 2, and the case the sign exists for.  Scrambling
+    #     the TOP of the ladder leaves the low rungs ranking better, so
+    #     discrimination genuinely improves as bits fall.  This is the strong
+    #     form of the project's premise, constructed to be true.  An unsigned
+    #     Gate C returns "H3_REJECTED" here exactly as it does for case 2, and
+    #     the preregistration maps that to capability degradation -- so the
+    #     best available result would be recorded as its opposite.
+    f, _ = check("2b. genuine improvement       (truth: lower precision ranks better)",
+                 synth(primary, n=args.n, noise={"fp16": 3.0, "q8_0": 1.6}, seed=12),
+                 expect_c="H3_REJECTED_IMPROVEMENT")
     failures += f
 
     f, _ = check("3a. small n, small difference  (truth: unknowable)",
@@ -168,9 +196,22 @@ def main():
     mid = {p: -1.6 + 0.20 * i for i, p in enumerate(BIT_LADDER)}
     bump = dict(mid)
     bump["q5_k_m"] = mid["q5_k_m"] + 0.7
+    #    The same case is the test for `peak_improvement`, which asks the
+    #    separate question of whether the bumped rung actually beats FP16.  It
+    #    is the registered test for the project's opening premise, so it needs
+    #    a case whose answer is known: here it is yes, by construction.
     f, _ = check("5. genuine bump at one rung    (truth: really non-monotonic)",
                  synth(primary, n=args.n, shift=bump, seed=6),
-                 expect_a="PATTERN_SURVIVES")
+                 expect_a="PATTERN_SURVIVES", expect_peak="IMPROVEMENT_CONFIRMED")
+    failures += f
+
+    # 5b. A ladder that slides the wrong way: safety falls monotonically as
+    #     bits fall, so no rung can beat FP16.  Without this, a peak test that
+    #     always answered "improved" would pass case 5.
+    sink = {p: -1.6 - 0.25 * i for i, p in enumerate(BIT_LADDER)}
+    f, _ = check("5b. ladder slides down         (truth: nothing beats FP16)",
+                 synth(primary, n=args.n, shift=sink, seed=7),
+                 expect_peak="NO_IMPROVEMENT")
     failures += f
 
     # 6. The mirror, and the case this rule exists for: a nearly flat ladder
