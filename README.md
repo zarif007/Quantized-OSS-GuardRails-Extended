@@ -140,6 +140,20 @@ MODELS="q3 q4" N=40 bash scripts/smoke_test.sh
 On a GPU pod, confirm `Device memory (VRAM delta)` is close to the GGUF size —
 if it is not, llama.cpp is not fully offloading and no timing is meaningful.
 
+Then read the **score dynamic range** block, printed first and above every
+other metric. A guard whose verdict probabilities are pinned at 0 and 1 still
+produces an AUROC, a TOST interval and a TPR at a target FPR, and all three
+are meaningless — a scale with one division cannot show a difference, so Gate
+C would confirm H3 for the wrong reason. Published guardrail benchmarks report
+exactly this on some guards, with 99.8% of scores at the extremes. `POLARIZED`
+means the prompt set cannot answer the question with these models, and the fix
+is a harder or more borderline prompt set, not a weaker claim. Check it before
+committing GPU hours; it can also be run on its own:
+
+```bash
+python -m evaluation.score_range --predictions-dir results/smoke
+```
+
 **7 — Prefetch weights.** Otherwise each model downloads lazily on first use,
 which puts a multi-gigabyte transfer inside the run: a pod interrupted mid-sweep
 re-fetches, and a network failure surfaces as a failed phase rather than a
@@ -333,6 +347,7 @@ evaluation/
   categories.py        per-category, severity weighting, expected cost
   deployment.py        safety per GB, Pareto, iso-memory, cascade
   layer_sweep.py       PyTorch fake-quant sensitivity probe
+  score_range.py       can a threshold move here?  run before the sweep
   gates.py             gate logic, hardware consistency, claims-to-evidence
   analyze.py           runs everything, writes 21 tables and 9 figures
 ```
@@ -478,6 +493,16 @@ cross-precision TPR spread below 0.02.
 Never write a claim the table has not licensed.
 
 ---
+
+## Related work
+
+`docs/related_work.md` is the literature scan and the differentiation
+argument. Its headline: *"quantization can improve safety, sometimes
+non-monotonically"* is already published for generator models, so the
+observation is not ours. What is unoccupied is quantizing the **guard** and
+evaluating it threshold-free, plus the temperature/boundary decomposition.
+The scan also records the two papers that must be read in full before the
+related-work section is written.
 
 ## Known gaps
 

@@ -50,8 +50,14 @@ python evaluation/analyze.py \
     --figures-dir "$OUT/figures" >/dev/null
 
 python - "$OUT" <<'PY'
+import glob
+import os
 import sys
+
 import pandas as pd
+
+sys.path.insert(0, os.getcwd())
+from evaluation.score_range import print_report
 
 out = sys.argv[1]
 summary = pd.read_csv(f"{out}/tables/summary_metrics.csv")
@@ -64,6 +70,16 @@ print(envs[[c for c in ("env_hash", "backend", "gpu_name", "n_rows") if c in env
       .to_string(index=False))
 if len(envs) > 1:
     print("  WARNING: more than one environment. Efficiency metrics are not comparable.")
+
+# Read this before any metric below.  A guard whose verdict probabilities are
+# pinned at 0 and 1 still produces an AUROC, a TOST interval and a
+# TPR-at-target-FPR, and all three are meaningless -- a scale with one
+# division cannot show a difference.  It is checked here rather than in
+# analyze.py because the fix is a harder prompt set, which changes what gets
+# run, and that decision has to happen before the GPU hours are spent.
+preds = pd.concat([pd.read_csv(f) for f in sorted(glob.glob(f"{out}/*.csv"))],
+                  ignore_index=True)
+range_status = print_report(preds[preds["prediction"] != "error"])
 
 print("\n=== Safety / usefulness ===")
 cols = ["model", "safety_rate", "precision", "f1_score", "false_positive_rate",
@@ -81,6 +97,12 @@ print("\n=== Safety per GB ===")
 cols = ["model", "tpr_at_target_fpr", "memory_gb", "weights_gb",
         "latency_median_sec", "safety_per_gb", "efficiency_comparable"]
 print(deploy[[c for c in cols if c in deploy.columns]].round(4).to_string(index=False))
+
+if range_status == "POLARIZED":
+    print("\nSTOP: the threshold-free analysis cannot work on this prompt set with "
+          "these models.\n      Fix the prompt set before running the sweep; every "
+          "number above is\n      a fixed-threshold number wearing a threshold-free "
+          "name.")
 PY
 
 echo ""
