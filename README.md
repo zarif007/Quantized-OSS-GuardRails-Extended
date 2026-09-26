@@ -359,6 +359,7 @@ scripts/
   build_toolchain.sh     compile llama-quantize and llama-imatrix
   build_imatrix.py       generic vs safety-domain calibration
   build_mixed_precision.py  protect top-k sensitive layers
+  output_asymmetry.py    why the boundary moves: label-row quantization error
 evaluation/
   hardware.py          backend detection, GPU metadata, VRAM sampling
   profiling.py         backend-aware memory, median-based latency
